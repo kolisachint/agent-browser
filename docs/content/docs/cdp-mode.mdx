@@ -79,7 +79,7 @@ This is useful when:
 
 ## Tab pinning
 
-When several sessions share one browser over CDP, each session remembers which tab it is bound to (by CDP target id, persisted across daemon restarts). A restarted daemon reattaches to the session's own tab instead of adopting whatever tab is currently active, which in a shared browser is usually another session's.
+When several sessions share one browser over CDP, each session remembers which tab it is bound to (by CDP target id, persisted across daemon restarts). A restarted daemon reattaches to the session's own tab instead of adopting whatever tab is currently active, which in a shared browser is usually another session's. The session also remembers the CDP endpoint itself, so after its daemon dies the next command reattaches to that same endpoint without needing `--cdp` again, and never launches a private browser instead; when the endpoint is gone the command fails with a clear error instead. An explicit `close` forgets the endpoint.
 
 Pass `--pin-tab` (or set `AGENT_BROWSER_PIN_TAB=1`) to make the binding strict:
 

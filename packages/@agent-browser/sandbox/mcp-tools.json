@@ -4672,7 +4672,7 @@
         "openWorldHint": true,
         "readOnlyHint": true
       },
-      "description": "Wait for a browser download. A path is rejected over --cdp, --auto-connect, or a provider.",
+      "description": "Wait for a browser download. Each session keeps its own download folder on a shared browser and only reports its own downloads. A path is rejected over a remote --cdp endpoint, --auto-connect, or a provider.",
       "inputSchema": {
         "properties": {
           "path": {

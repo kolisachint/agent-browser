@@ -324,6 +324,11 @@ impl Running {
         self.str(Key::CdpHeaders)
     }
 
+    /// The session's own download folder, if one is configured.
+    pub fn download_path(&self) -> Option<String> {
+        self.str(Key::DownloadPath)
+    }
+
     /// Verbatim extensions value for the session's extensions file.
     pub fn extensions_file_contents(&self) -> Option<&str> {
         self.extensions_file.as_deref()

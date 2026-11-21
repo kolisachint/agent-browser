@@ -2834,7 +2834,8 @@ Modes:
   --load <state>       Wait for load state (load, domcontentloaded, networkidle)
   --fn <expression>    Wait for JavaScript expression to be truthy
   --text <text>        Wait for text to appear on page (substring match)
-  --download [path]    Wait for a download to complete (optionally save to path)
+  --download [path]    Wait for a download to complete (optionally save to path).
+                       Each session keeps its own download folder on a shared browser
 
 Selector Wait Options:
   --state <state>      visible, hidden, attached, or detached
@@ -3037,7 +3038,8 @@ agent-browser close - Close the browser
 
 Usage: agent-browser close [options]
 
-Closes the browser instance for the current session.
+Closes the browser instance for the current session. Closing also forgets a
+persisted CDP endpoint, so the next session under this name starts fresh.
 
 Aliases: quit, exit
 
@@ -4961,6 +4963,9 @@ Options:
   --no-auto-connect          Return a session attached with --auto-connect to a local launch
                              (or --auto-connect false; overrides AGENT_BROWSER_AUTO_CONNECT)
   --cdp <port|url>           Connect via CDP; root WebSocket query slash is optional
+                             The endpoint persists with the session: after its daemon dies
+                             the next command reattaches to it instead of launching
+                             a private browser
   --cdp-headers <json>       Headers for --cdp discovery and handshake, e.g. Authorization
                              (or AGENT_BROWSER_CDP_HEADERS env)
   --pin-tab                  Pin the session to its bound tab (or AGENT_BROWSER_PIN_TAB env)

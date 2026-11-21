@@ -1186,7 +1186,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_WAIT_FOR_DOWNLOAD,
             "Wait for download",
-            "Wait for a browser download. A path is rejected over --cdp, --auto-connect, or a provider.",
+            "Wait for a browser download. Each session keeps its own download folder on a shared browser and only reports its own downloads. A path is rejected over a remote --cdp endpoint, --auto-connect, or a provider.",
             json!({ "path": { "type": "string", "description": "Optional output path." }, "waitTimeoutMs": wait_timeout_schema() }),
             &[],
         ),

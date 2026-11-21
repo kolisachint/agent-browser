@@ -26,7 +26,7 @@ agent-browser wait --download ./archive.zip --timeout 30000
 
 Use `download` when a specific element triggers the download. Use `wait --download` when another action starts the download and you need to wait for completion.
 
-Both commands save to a local path only for a browser agent-browser launched. Over `--cdp`, `--auto-connect`, or a provider, the remote endpoint names the saved file, so `download` and `wait --download <path>` are rejected. `wait --download` without a path still reports where the browser saved the file.
+Both commands save to a local path for a browser agent-browser launched and for a loopback `--cdp` endpoint, which names files on this machine. Over a remote `--cdp` endpoint, `--auto-connect`, or a provider, the remote endpoint names the saved file, so `download` and `wait --download <path>` are rejected. `wait --download` without a path still reports where the browser saved the file.
 
 Set a default download directory for browser-initiated downloads:
 
@@ -34,7 +34,7 @@ Set a default download directory for browser-initiated downloads:
 agent-browser --download-path ./downloads open https://app.example.com
 ```
 
-Without `--download-path`, downloads go to a temporary directory that is cleaned up when the browser closes.
+Without `--download-path`, downloads go to a temporary directory that is cleaned up when the browser closes. Each session keeps its own download folder: with several sessions on one browser, a download started in a tab owned by one session lands in that session's folder and is reported only by that session's `wait --download`.
 
 ## Screenshots and PDFs
 

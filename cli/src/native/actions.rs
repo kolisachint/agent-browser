@@ -30,7 +30,7 @@ use super::cdp::types::{
 };
 use super::cookies;
 use super::diff;
-use super::downloads::{DownloadLedger, DownloadState};
+use super::downloads::{download_is_owned, DownloadLedger, DownloadRecord, DownloadState};
 use super::element::RefMap;
 use super::inspect_server::InspectServer;
 use super::interaction;
@@ -407,6 +407,80 @@ fn resolve_launch_target(cmd: &Value, attached: Option<&AttachedTarget>) -> Opti
     Some(Value::Object(resolved))
 }
 
+/// How many frame-to-session entries the download router keeps. Cleared when
+/// full; a missed frame only falls back to claiming the download, as before.
+const MAX_DOWNLOAD_FRAMES: usize = 4096;
+
+/// Remember which CDP session a frame belongs to, from `Page.frameNavigated`
+/// (`params.frame.id`) and `Page.frameAttached` (`params.frameId`).
+/// `Browser.download*` events are sessionless; this index attributes them to
+/// the tab that started the download, so sessions sharing one browser only
+/// claim their own downloads. A free function so the drain loop can update it
+/// while holding its event-receiver borrow.
+fn note_download_frame(frames: &mut HashMap<String, String>, event: &CdpEvent) {
+    let frame_id: Option<&str> = match event.method.as_str() {
+        "Page.frameNavigated" => event
+            .params
+            .get("frame")
+            .and_then(|frame| frame.get("id"))
+            .and_then(Value::as_str),
+        "Page.frameAttached" => event.params.get("frameId").and_then(Value::as_str),
+        _ => return,
+    };
+    let (Some(frame_id), Some(session)) = (frame_id, event.session_id.as_deref()) else {
+        return;
+    };
+    if frames.len() >= MAX_DOWNLOAD_FRAMES {
+        frames.clear();
+    }
+    frames.insert(frame_id.to_string(), session.to_string());
+}
+
+/// Rebuild the in-memory attach target from a persisted CDP endpoint: a
+/// bare port round-trips the `CdpPort` form, anything else the `CdpUrl` form.
+fn attached_target_from_endpoint(endpoint: &str) -> AttachedTarget {
+    let trimmed = endpoint.trim();
+    match trimmed.parse::<u16>() {
+        Ok(port) if port > 0 => AttachedTarget::CdpPort(u64::from(port)),
+        _ => AttachedTarget::CdpUrl(trimmed.to_string()),
+    }
+}
+
+/// Whether a CDP endpoint resolves to this machine, so files the browser
+/// reports are local files this daemon may move. A bare port always is;
+/// otherwise only loopback hosts are.
+fn cdp_endpoint_is_loopback(endpoint: &str) -> bool {
+    let trimmed = endpoint.trim();
+    if trimmed.parse::<u16>().is_ok() {
+        return true;
+    }
+    let Some(host) = endpoint_host(trimmed) else {
+        return false;
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1" | "[::1]"
+    )
+}
+
+/// Host of an http(s)/ws(s) endpoint, if it parses as one.
+fn endpoint_host(endpoint: &str) -> Option<String> {
+    let without_scheme = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    let host_port = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
+    let host = host_port
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(host_port);
+    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    (!host.is_empty()).then(|| host.to_string())
+}
+
 fn validate_ca_cert_launch_mode(
     options: &LaunchOptions,
     engine: Option<&str>,
@@ -692,8 +766,23 @@ pub struct DaemonState {
     event_rx: Option<broadcast::Receiver<CdpEvent>>,
     /// Downloads seen on the attached browser, for `wait --download`.
     downloads: DownloadLedger,
+    /// Frame id to CDP session id, from `Page.frameNavigated` and
+    /// `Page.frameAttached`. Attributes sessionless `Browser.download*`
+    /// events to the tab that started the download, so sessions sharing one
+    /// browser only claim their own downloads. Bounded; cleared when full.
+    download_frames: HashMap<String, String>,
     pub webmcp: webmcp::RuntimeState,
-    /// Whether the active launch opted into Chrome's experimental WebMCP features.
+    /// Apply the session's download folder after attaching to a browser the
+/// daemon did not launch, so passive downloads report `Browser.download*`
+/// events with their path (AB-3). Local launches set this up themselves.
+async fn apply_session_download_behavior(state: &mut DaemonState) {
+    let path = state.settings.download_path();
+    if let Some(ref mut mgr) = state.browser {
+        mgr.apply_session_download_path(path).await;
+    }
+}
+
+/// Whether the active launch opted into Chrome's experimental WebMCP features.
     pub webmcp_enabled: bool,
     pub screencasting: bool,
     pub policy: Option<ActionPolicy>,
@@ -889,7 +978,14 @@ impl DaemonState {
         }
         // A session that opened its own window stays in background mode
         // across daemon restarts without repeating `window new`.
-        let own_window = binding.is_some_and(|b| b.own_window);
+        let own_window = binding.as_ref().is_some_and(|b| b.own_window);
+        // A session bound to a CDP endpoint reattaches to that same endpoint
+        // after its daemon dies (AB-4): target-less launches resolve to it,
+        // and a private browser is never launched instead. Nothing is seeded
+        // for locally launched browsers: their browser died with the daemon.
+        let attached_target = binding
+            .and_then(|b| b.cdp)
+            .map(|endpoint| attached_target_from_endpoint(&endpoint));
         Self {
             browser: None,
             appium: None,
@@ -935,6 +1031,7 @@ impl DaemonState {
             recording_state: RecordingState::new(),
             event_rx: None,
             downloads: DownloadLedger::default(),
+            download_frames: HashMap::new(),
             webmcp: webmcp::RuntimeState::default(),
             webmcp_enabled: false,
             screencasting: false,
@@ -979,7 +1076,7 @@ impl DaemonState {
             idle_activity: Arc::new(IdleActivity::new()),
             launch_identity: None,
             cdp_headers: None,
-            attached_target: None,
+            attached_target,
             effective_ca_cert: None,
             network_auto_attach_installed: false,
             session_setup: SessionSetup::default(),
@@ -1893,7 +1990,12 @@ impl DaemonState {
         loop {
             match rx.try_recv() {
                 Ok(event) => {
-                    if self.downloads.observe(&event.method, &event.params) {
+                    note_download_frame(&mut self.download_frames, &event);
+                    if self.downloads.observe(
+                        &event.method,
+                        &event.params,
+                        event.session_id.as_deref(),
+                    ) {
                         continue;
                     }
                     // Target events are not session-scoped; handle them first
@@ -3504,10 +3606,16 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
                 Err(e) => Err(e),
             };
             if let Err(e) = launched {
-                let context = auto_launch_error_context(matches!(
-                    state.settings.connection(),
-                    Connection::Cdp(_)
-                ));
+                // The endpoint may come from a persisted binding rather than
+                // the current settings (AB-4): a reattach after the daemon
+                // died. Either way a failure names the CDP endpoint, and a
+                // private browser is never launched instead.
+                let names_cdp = matches!(state.settings.connection(), Connection::Cdp(_))
+                    || matches!(
+                        state.attached_target,
+                        Some(AttachedTarget::CdpUrl(_)) | Some(AttachedTarget::CdpPort(_))
+                    );
+                let context = auto_launch_error_context(names_cdp);
                 let rollback = rollback_launch_settings(state, &mut settings_outcome, &e).await;
                 let e = with_rollback_error(&e, rollback);
                 let mut resp = error_response(&id, &format!("{}: {}", context, e));
@@ -3980,11 +4088,17 @@ fn auto_launch_error_context(has_cdp: bool) -> &'static str {
 fn maybe_persist_tab_binding(state: &mut DaemonState) -> Option<String> {
     let mgr = state.browser.as_ref()?;
     let (target_id, url) = mgr.binding_snapshot()?;
+    // Persist the CDP endpoint alongside the tab (AB-4): after the daemon
+    // dies, the next command reattaches to it instead of launching a private
+    // browser.
+    let connection = state.settings.connection();
+    let cdp = persisted_cdp_endpoint(state.attached_target.as_ref(), &connection);
     let binding = tab_binding::TabBinding {
         target_id,
         url: tab_binding::sanitize_url(&url),
         pinned: state.pin_tab,
         own_window: state.own_window,
+        cdp,
     };
     if state.last_persisted_binding.as_ref() == Some(&binding) {
         return None;
@@ -5144,6 +5258,7 @@ async fn launch_browser_from_settings(
         state.browser = Some(mgr);
         state.launch_identity = Some(state.settings.launch_identity());
         state.subscribe_to_browser_events();
+        apply_session_download_behavior(state).await;
         state.start_fetch_handler();
         state.start_dialog_handler();
         apply_tab_binding_on_attach_or_rollback(state).await?;
@@ -5177,6 +5292,7 @@ async fn launch_browser_from_settings(
         }
         state.launch_identity = Some(state.settings.launch_identity());
         state.subscribe_to_browser_events();
+        apply_session_download_behavior(state).await;
         state.start_fetch_handler();
         state.start_dialog_handler();
         state.update_stream_client().await;
@@ -6968,6 +7084,17 @@ async fn close_session(state: &mut DaemonState, forget_settings: bool) -> Result
     };
     close_all_browser_backends(state).await?;
     state.attached_target = None;
+    // An explicit close ends the session: forget the CDP endpoint so the
+    // next session under this name starts fresh instead of reattaching to a
+    // browser it no longer owns. Best effort, like the pin release below.
+    if let Ok(Some(mut binding)) = tab_binding::load(&state.session_id) {
+        if binding.cdp.is_some() {
+            binding.cdp = None;
+            if tab_binding::save(&state.session_id, &binding).is_ok() {
+                state.last_persisted_binding = Some(binding);
+            }
+        }
+    }
 
     // Stop background Fetch handler
     if let Some(task) = state.fetch_handler_task.take() {
@@ -9526,6 +9653,7 @@ async fn download_to_path(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     const DOWNLOAD_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
     let deadline = tokio::time::Instant::now() + DOWNLOAD_TIMEOUT;
     let mut downloaded_guid: Option<String> = None;
+    let mut fallback_guid: Option<String> = None;
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -9545,28 +9673,43 @@ async fn download_to_path(cmd: &Value, state: &mut DaemonState) -> Result<Value,
                     method == browser_method || (method == page_method && is_page_session)
                 };
 
-                // Capture the GUID from downloadWillBegin
+                // Capture the GUID from downloadWillBegin. A Page event on
+                // this session names this session's own download and wins
+                // over a Browser event, which may belong to another session
+                // sharing the browser.
                 if is_download_event(
                     &event.method,
                     "Browser.downloadWillBegin",
                     "Page.downloadWillBegin",
                 ) {
                     if let Some(guid) = event.params.get("guid").and_then(|v| v.as_str()) {
-                        downloaded_guid = Some(guid.to_string());
+                        if event.method == "Page.downloadWillBegin" {
+                            downloaded_guid = Some(guid.to_string());
+                        } else if downloaded_guid.is_none() && fallback_guid.is_none() {
+                            fallback_guid = Some(guid.to_string());
+                        }
                     }
                 }
-                // Check for download completion or cancellation
+                // Check for download completion or cancellation, but only for
+                // the download this click started: another session's download
+                // finishing first must not end this wait.
                 if is_download_event(
                     &event.method,
                     "Browser.downloadProgress",
                     "Page.downloadProgress",
                 ) {
-                    match event.params.get("state").and_then(|v| v.as_str()) {
-                        Some("completed") => break,
-                        Some("canceled") => {
-                            return Err("Download was canceled".to_string());
+                    let guid = event.params.get("guid").and_then(|v| v.as_str());
+                    let is_ours = downloaded_guid.as_deref().is_some_and(|g| Some(g) == guid)
+                        || (downloaded_guid.is_none()
+                            && fallback_guid.as_deref().is_some_and(|g| Some(g) == guid));
+                    if is_ours {
+                        match event.params.get("state").and_then(|v| v.as_str()) {
+                            Some("completed") => break,
+                            Some("canceled") => {
+                                return Err("Download was canceled".to_string());
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -9575,6 +9718,7 @@ async fn download_to_path(cmd: &Value, state: &mut DaemonState) -> Result<Value,
             Err(_) => return Err("Timeout waiting for download to complete".to_string()),
         }
     }
+    let downloaded_guid = downloaded_guid.or(fallback_guid);
 
     if let Some(ref guid) = downloaded_guid {
         state.downloads.mark_claimed(guid);
@@ -12842,13 +12986,16 @@ async fn handle_waitfordownload(cmd: &Value, state: &mut DaemonState) -> Result<
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
     let record = loop {
-        if let Some(record) = state.downloads.claim_finished() {
+        if let Some(record) = claim_owned_download(state) {
             break record;
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(event)) => {
-                state.downloads.observe(&event.method, &event.params);
+                note_download_frame(&mut state.download_frames, &event);
+                state
+                    .downloads
+                    .observe(&event.method, &event.params, event.session_id.as_deref());
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(_)) => return Err("Event stream closed".to_string()),
@@ -12870,11 +13017,15 @@ async fn handle_waitfordownload(cmd: &Value, state: &mut DaemonState) -> Result<
     };
     let saved = PathBuf::from(saved);
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let launched_locally = !mgr.is_cdp_connection();
     let download_dir = mgr.download_path.clone();
-    // A CDP endpoint reports a path on its own filesystem, which may not be
-    // this machine's.
-    if launched_locally && !wait_for_downloaded_file(&saved).await {
+    // `Browser.setDownloadBehavior` is browser-global, so with several
+    // sessions on one browser the file may have landed in another session's
+    // folder. An owned download is moved into this session's folder (AB-3).
+    // A remote CDP endpoint reports a path on its own filesystem, which may
+    // not be this machine's.
+    let local_filesystem = download_filesystem_is_local(state);
+    let saved = relocate_owned_download(saved, download_dir.as_deref(), local_filesystem);
+    if local_filesystem && !wait_for_downloaded_file(&saved).await {
         return Err(format!(
             "Download completed but no file is at {}",
             saved.display()
@@ -12884,10 +13035,10 @@ async fn handle_waitfordownload(cmd: &Value, state: &mut DaemonState) -> Result<
     let Some(path_str) = path_arg else {
         return Ok(json!({ "path": saved.to_string_lossy() }));
     };
-    if !may_move_download(&saved, launched_locally, download_dir.as_deref()) {
+    if !may_move_download(&saved, local_filesystem, download_dir.as_deref()) {
         state.downloads.release(&record.guid);
         return Err(format!(
-            "Refusing to move {}: only downloads from a browser agent-browser launched, inside its download directory, can be moved",
+            "Refusing to move {}: only downloads from a browser agent-browser launched or a local CDP endpoint, inside its download directory, can be moved",
             saved.display()
         ));
     }
@@ -12908,24 +13059,113 @@ fn guid_download_path(download_dir: &std::path::Path, guid: &str) -> Result<Path
     Ok(path)
 }
 
+/// Claim the oldest finished download this session owns. Sessions sharing one
+/// browser all observe every download; a pinned session only takes downloads
+/// its bound tab started, so one client's file never lands in another's
+/// ledger (AB-3). Legacy sessions keep the old claim-anything behavior.
+fn claim_owned_download(state: &mut DaemonState) -> Option<DownloadRecord> {
+    let mgr = state.browser.as_ref()?;
+    let bound = mgr.bound_target_id().map(str::to_string);
+    let frames = &state.download_frames;
+    state.downloads.claim_finished_where(|record| {
+        let owner = record.page_session.as_deref().or_else(|| {
+            record
+                .frame_id
+                .as_deref()
+                .and_then(|frame| frames.get(frame).map(String::as_str))
+        });
+        download_is_owned(owner, bound.as_deref(), |session| {
+            mgr.target_id_for_session(session).map(str::to_string)
+        })
+    })
+}
+
+/// Whether files the attached browser reports live on this machine: a browser
+/// this daemon launched, or a loopback CDP endpoint.
+fn download_filesystem_is_local(state: &DaemonState) -> bool {
+    let Some(mgr) = state.browser.as_ref() else {
+        return false;
+    };
+    if !mgr.is_cdp_connection() {
+        return true;
+    }
+    matches!(state.settings.connection(), Connection::Cdp(endpoint) if cdp_endpoint_is_loopback(&endpoint))
+}
+
+/// The CDP endpoint to persist with the tab binding (AB-4): the in-memory
+/// attach target wins, otherwise the sticky settings hold the endpoint of
+/// the last explicit attach.
+fn persisted_cdp_endpoint(
+    attached: Option<&AttachedTarget>,
+    connection: &Connection,
+) -> Option<String> {
+    match attached {
+        Some(AttachedTarget::CdpUrl(url)) => Some(url.clone()),
+        Some(AttachedTarget::CdpPort(port)) => Some(port.to_string()),
+        _ => match connection {
+            Connection::Cdp(endpoint) => Some(endpoint.clone()),
+            _ => None,
+        },
+    }
+}
+
+/// Move an owned download into this session's folder when it landed
+/// elsewhere. On any failure the original path is kept, so the wait still
+/// reports the finished download.
+fn relocate_owned_download(
+    saved: PathBuf,
+    download_dir: Option<&str>,
+    local_filesystem: bool,
+) -> PathBuf {
+    let Some(dir) = download_dir else {
+        return saved;
+    };
+    if path_inside(&saved, dir) {
+        return saved;
+    }
+    if !local_filesystem {
+        return saved;
+    }
+    let Some(name) = saved.file_name() else {
+        return saved;
+    };
+    let dest = PathBuf::from(dir).join(name);
+    if dest == saved {
+        return saved;
+    }
+    if (PathBuf::from(dir).exists() || fs::create_dir_all(dir).is_ok())
+        && (fs::rename(&saved, &dest).is_ok()
+            || (fs::copy(&saved, &dest).is_ok() && fs::remove_file(&saved).is_ok()))
+    {
+        return dest;
+    }
+    saved
+}
+
+/// Whether `path` resolves inside `dir`.
+fn path_inside(path: &std::path::Path, dir: &str) -> bool {
+    match (fs::canonicalize(path), fs::canonicalize(dir)) {
+        (Ok(path), Ok(dir)) => path.starts_with(dir),
+        _ => false,
+    }
+}
+
 /// The saved path comes from a CDP event, so only a browser this daemon
-/// launched is trusted to name a local file. A remote endpoint could otherwise
-/// point the move at any file the daemon can read.
+/// launched (or a loopback CDP endpoint naming this machine's files) is
+/// trusted to name a local file. A remote endpoint could otherwise point the
+/// move at any file the daemon can read.
 fn may_move_download(
     saved: &std::path::Path,
-    launched_locally: bool,
+    local_filesystem: bool,
     download_dir: Option<&str>,
 ) -> bool {
-    if !launched_locally {
+    if !local_filesystem {
         return false;
     }
     let Some(dir) = download_dir else {
         return true;
     };
-    match (fs::canonicalize(saved), fs::canonicalize(dir)) {
-        (Ok(saved), Ok(dir)) => saved.starts_with(dir),
-        _ => false,
-    }
+    path_inside(saved, dir)
 }
 
 fn move_download(saved: &std::path::Path, path_str: &str) -> Result<Value, String> {
@@ -16748,6 +16988,187 @@ mod tests {
     }
 
     #[test]
+    fn attached_target_round_trips_persisted_endpoints() {
+        assert_eq!(
+            super::attached_target_from_endpoint("9222"),
+            super::AttachedTarget::CdpPort(9222)
+        );
+        assert_eq!(
+            super::attached_target_from_endpoint("http://127.0.0.1:9333"),
+            super::AttachedTarget::CdpUrl("http://127.0.0.1:9333".to_string())
+        );
+        assert_eq!(
+            super::attached_target_from_endpoint("ws://127.0.0.1:9222/devtools/browser/x"),
+            super::AttachedTarget::CdpUrl("ws://127.0.0.1:9222/devtools/browser/x".to_string())
+        );
+    }
+
+    #[test]
+    fn persisted_endpoint_prefers_the_attach_target() {
+        use crate::session_settings::Connection;
+        let cdp = Connection::Cdp("http://127.0.0.1:9333".to_string());
+        assert_eq!(
+            super::persisted_cdp_endpoint(
+                Some(&super::AttachedTarget::CdpUrl(
+                    "ws://127.0.0.1:1/x".to_string()
+                )),
+                &cdp
+            ),
+            Some("ws://127.0.0.1:1/x".to_string())
+        );
+        assert_eq!(
+            super::persisted_cdp_endpoint(Some(&super::AttachedTarget::CdpPort(9222)), &cdp),
+            Some("9222".to_string())
+        );
+        assert_eq!(
+            super::persisted_cdp_endpoint(None, &cdp),
+            Some("http://127.0.0.1:9333".to_string())
+        );
+        assert_eq!(
+            super::persisted_cdp_endpoint(None, &Connection::Local),
+            None
+        );
+        assert_eq!(
+            super::persisted_cdp_endpoint(None, &Connection::AutoConnect),
+            None
+        );
+    }
+
+    #[test]
+    fn loopback_detection_covers_ports_and_local_hosts() {
+        assert!(super::cdp_endpoint_is_loopback("9222"));
+        assert!(super::cdp_endpoint_is_loopback("http://127.0.0.1:9333"));
+        assert!(super::cdp_endpoint_is_loopback(
+            "ws://localhost:9222/devtools/browser/x"
+        ));
+        assert!(!super::cdp_endpoint_is_loopback("http://192.168.1.2:9222"));
+        assert!(!super::cdp_endpoint_is_loopback("https://example.com"));
+        assert!(!super::cdp_endpoint_is_loopback("not a target"));
+    }
+
+    #[test]
+    fn relocate_moves_misdirected_downloads_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = dir.path().join("mine");
+        let theirs = dir.path().join("theirs");
+        std::fs::create_dir(&mine).unwrap();
+        std::fs::create_dir(&theirs).unwrap();
+        let foreign = theirs.join("report.bin");
+        std::fs::write(&foreign, "data").unwrap();
+        let mine_str = mine.to_str().unwrap();
+
+        let moved = super::relocate_owned_download(foreign.clone(), Some(mine_str), true);
+        assert_eq!(moved, mine.join("report.bin"));
+        assert!(!foreign.exists());
+        assert_eq!(std::fs::read(&moved).unwrap(), b"data");
+
+        // Already home: untouched. Remote filesystems and missing folders
+        // keep the reported path.
+        let home = super::relocate_owned_download(moved.clone(), Some(mine_str), true);
+        assert_eq!(home, moved);
+        let stranded = theirs.join("stuck.bin");
+        std::fs::write(&stranded, "data").unwrap();
+        assert_eq!(
+            super::relocate_owned_download(stranded.clone(), Some(mine_str), false),
+            stranded
+        );
+        assert_eq!(
+            super::relocate_owned_download(stranded.clone(), None, true),
+            stranded
+        );
+    }
+
+    #[test]
+    fn frame_index_records_navigated_and_attached_frames() {
+        use super::super::cdp::types::CdpEvent;
+        let mut frames = std::collections::HashMap::new();
+        super::note_download_frame(
+            &mut frames,
+            &CdpEvent {
+                method: "Page.frameNavigated".to_string(),
+                params: serde_json::json!({ "frame": { "id": "F1" } }),
+                session_id: Some("s1".to_string()),
+            },
+        );
+        super::note_download_frame(
+            &mut frames,
+            &CdpEvent {
+                method: "Page.frameAttached".to_string(),
+                params: serde_json::json!({ "frameId": "F2", "parentFrameId": "F1" }),
+                session_id: Some("s1".to_string()),
+            },
+        );
+        assert_eq!(frames.get("F1").map(String::as_str), Some("s1"));
+        assert_eq!(frames.get("F2").map(String::as_str), Some("s1"));
+        // Sessionless events carry no owner: ignored.
+        super::note_download_frame(
+            &mut frames,
+            &CdpEvent {
+                method: "Page.frameNavigated".to_string(),
+                params: serde_json::json!({ "frame": { "id": "F3" } }),
+                session_id: None,
+            },
+        );
+        assert!(!frames.contains_key("F3"));
+    }
+
+    #[tokio::test]
+    async fn boot_seeds_attach_target_from_persisted_endpoint() {
+        use super::super::tab_binding::{save, TabBinding};
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "XDG_RUNTIME_DIR",
+            "AGENT_BROWSER_SESSION",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("XDG_RUNTIME_DIR");
+        guard.set("AGENT_BROWSER_SESSION", "seeded-cdp-endpoint");
+        save(
+            "seeded-cdp-endpoint",
+            &TabBinding {
+                target_id: "ABCDEF0123456789".to_string(),
+                url: "https://example.com/".to_string(),
+                pinned: false,
+                own_window: false,
+                cdp: Some("9222".to_string()),
+            },
+        )
+        .unwrap();
+        let state = super::DaemonState::new();
+        assert_eq!(
+            state.attached_target,
+            Some(super::AttachedTarget::CdpPort(9222))
+        );
+    }
+
+    #[tokio::test]
+    async fn close_forgets_the_persisted_endpoint() {
+        use super::super::tab_binding::{load, save, TabBinding};
+        let (_env, mut state) = isolated_state();
+        state.session_id = "close-forgets-cdp".to_string();
+        save(
+            &state.session_id,
+            &TabBinding {
+                target_id: "ABCDEF0123456789".to_string(),
+                url: "https://example.com/".to_string(),
+                pinned: false,
+                cdp: Some("9222".to_string()),
+            },
+        )
+        .unwrap();
+        let result = super::execute_command(
+            &serde_json::json!({ "action": "close", "id": "close-cdp" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(result["success"], true);
+        let binding = load(&state.session_id).unwrap().unwrap();
+        assert_eq!(binding.cdp, None);
+        assert_eq!(binding.target_id, "ABCDEF0123456789");
+    }
+
+    #[test]
     fn download_guid_must_name_a_file_in_the_download_dir() {
         let dir = std::path::Path::new("/tmp/downloads");
         assert_eq!(
@@ -17225,6 +17646,7 @@ mod tests {
                 url: "https://example.com".to_string(),
                 pinned: true,
                 own_window: false,
+                cdp: None,
             },
         )
         .unwrap();
@@ -26126,6 +26548,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
                 url: "https://example.com".to_string(),
                 pinned: false,
                 own_window: false,
+                cdp: None,
             },
         )
         .unwrap();

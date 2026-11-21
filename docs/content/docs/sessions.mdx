@@ -73,7 +73,7 @@ agent-browser --profile ./b get url
 
 ## Tab pinning in a shared browser
 
-Full isolation applies when each session launches its own browser. When sessions instead share one Chrome over `--cdp`, only the tab selection separates them. Each session remembers which tab it is bound to (by CDP target id, persisted across daemon restarts), so a restarted daemon reattaches to the session's own tab instead of adopting the most recently active one.
+Full isolation applies when each session launches its own browser. When sessions instead share one Chrome over `--cdp`, only the tab selection separates them. Each session remembers which tab it is bound to (by CDP target id, persisted across daemon restarts), so a restarted daemon reattaches to the session's own tab instead of adopting the most recently active one. The session also remembers the CDP endpoint it attached to, so after its daemon dies the next command reattaches to that same endpoint and never launches a private browser instead; when the endpoint is gone the command fails with a clear error. An explicit `close` forgets the endpoint, so the next session under the same name starts fresh.
 
 Add `--pin-tab` (or set `AGENT_BROWSER_PIN_TAB=1`) to make the binding strict:
 

@@ -3168,6 +3168,16 @@ impl BrowserManager {
             .map(|p| p.target_id.as_str())
     }
 
+    /// CDP target id for one of this manager's CDP session ids. Every daemon
+    /// attached to a shared browser holds a session per tab, so downloads
+    /// are attributed by target, not by raw session.
+    pub fn target_id_for_session(&self, session_id: &str) -> Option<&str> {
+        self.pages
+            .iter()
+            .find(|p| p.session_id == session_id)
+            .map(|p| p.target_id.as_str())
+    }
+
     /// Returns true if a tab with the given stable `tab_id` is still open.
     pub fn has_tab_id(&self, tab_id: u32) -> bool {
         self.pages.iter().any(|p| p.tab_id == tab_id)
@@ -3179,6 +3189,32 @@ impl BrowserManager {
 
     pub fn visited_origins(&self) -> &HashSet<String> {
         &self.visited_origins
+    }
+
+    /// Apply the session's download folder after attaching to a browser the
+    /// daemon did not launch. With a folder: save into it with events on.
+    /// Without one: keep the browser's location but still ask for events, so
+    /// passive downloads are observed and routed per session (AB-3).
+    /// Failures are ignored: proxied connections may not implement the
+    /// Browser domain.
+    pub async fn apply_session_download_path(&mut self, download_path: Option<String>) {
+        self.download_path = download_path;
+        let params = match self.download_path {
+            Some(ref path) => json!({
+                "behavior": "allow",
+                "downloadPath": path,
+                "eventsEnabled": true
+            }),
+            None => json!({ "behavior": "allow", "eventsEnabled": true }),
+        };
+        let _ = self
+            .client
+            .send_command(
+                "Browser.setDownloadBehavior",
+                Some(&params),
+                self.session_scope(),
+            )
+            .await;
     }
 
     /// Keep the configured download location and turn on `Browser.download*`

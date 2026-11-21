@@ -41,6 +41,13 @@ pub struct TabBinding {
     /// (no implicit `Page.bringToFront`) without repeating the command.
     #[serde(default)]
     pub own_window: bool,
+    /// CDP endpoint the session was attached to (`--cdp` value: a ws(s) URL,
+    /// http(s) URL, or port). Persisted so a session bound to a CDP endpoint
+    /// reattaches to that same endpoint after its daemon dies instead of
+    /// launching a private browser. `None` for locally launched browsers.
+    /// Cleared by an explicit `close`; never stores auth headers.
+    #[serde(default)]
+    pub cdp: Option<String>,
 }
 
 /// Path of the binding file for a session: `{socket_dir}/{session}.target`.
@@ -222,6 +229,7 @@ mod tests {
                 url: "https://example.com/checkout".to_string(),
                 pinned: true,
                 own_window: true,
+                cdp: None,
             };
             save("agent-1", &binding).unwrap();
             let loaded = load("agent-1").unwrap().unwrap();
@@ -243,6 +251,7 @@ mod tests {
                 url: "data:text/html,persisted-secret".to_string(),
                 pinned: true,
                 own_window: false,
+                cdp: None,
             };
 
             save("opaque", &binding).unwrap();
@@ -309,6 +318,7 @@ mod tests {
             url: String::new(),
             pinned: true,
             own_window: false,
+            cdp: None,
         };
         assert!(save("blocked", &binding).is_err());
     }
@@ -323,6 +333,7 @@ mod tests {
                 url: String::new(),
                 pinned: false,
                 own_window: false,
+                cdp: None,
             };
             save("perms", &binding).unwrap();
             let mode = fs::metadata(binding_path("perms"))
@@ -341,6 +352,7 @@ mod tests {
                 url: String::new(),
                 pinned: false,
                 own_window: false,
+                cdp: None,
             };
             save("tmpcheck", &binding).unwrap();
             let dir = binding_path("tmpcheck").parent().unwrap().to_path_buf();
@@ -361,12 +373,14 @@ mod tests {
                 url: String::new(),
                 pinned: false,
                 own_window: false,
+                cdp: None,
             };
             let b = TabBinding {
                 target_id: "BBBB".to_string(),
                 url: String::new(),
                 pinned: true,
                 own_window: true,
+                cdp: None,
             };
             save("session-a", &a).unwrap();
             save("session-b", &b).unwrap();
@@ -413,6 +427,7 @@ mod tests {
                 url: String::new(),
                 pinned,
                 own_window: false,
+                cdp: None,
             },
         )
         .unwrap();
@@ -485,6 +500,38 @@ mod tests {
             fs::write(&path, "{not json").unwrap();
             assert!(release_pin("bad").is_err());
             assert_eq!(fs::read_to_string(&path).unwrap(), "{not json");
+        });
+    }
+
+    #[test]
+    fn cdp_endpoint_round_trips() {
+        with_socket_dir(|| {
+            let binding = TabBinding {
+                target_id: "AAAA".to_string(),
+                url: "https://example.com/".to_string(),
+                pinned: true,
+                own_window: false,
+                cdp: Some("ws://127.0.0.1:9222/devtools/browser/x".to_string()),
+            };
+            save("cdp-round-trip", &binding).unwrap();
+            assert_eq!(load("cdp-round-trip").unwrap(), Some(binding));
+        });
+    }
+
+    #[test]
+    fn bindings_without_cdp_load_as_local() {
+        with_socket_dir(|| {
+            let path = binding_path("legacy-no-cdp");
+            fs::write(
+                &path,
+                r#"{"targetId":"AAAA","url":"https://example.com/","pinned":false}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                load("legacy-no-cdp").unwrap().unwrap().cdp,
+                None,
+                "a binding written before AB-4 has no endpoint and stays local"
+            );
         });
     }
 }
