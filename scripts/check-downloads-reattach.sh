@@ -165,7 +165,28 @@ launch_chrome() { # launch_chrome <profile-dir>: starts Chromium on $CDP_PORT
     fi
 }
 
+close_sessions() { # close_sessions <s...>: best effort bounded session close
+    local pids="" s pid
+    [ -x "${BIN:-}" ] || return 0
+    [ -n "${SOCK_DIR:-}" ] && [ -d "$SOCK_DIR" ] || return 0
+    for s in "$@"; do
+        AGENT_BROWSER_SOCKET_DIR="$SOCK_DIR" "$BIN" --session "$s" close >/dev/null 2>&1 &
+        pids="$pids $!"
+    done
+    local deadline=$((SECONDS + 90))
+    for pid in $pids; do
+        while kill -0 "$pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+        kill -9 "$pid" 2>/dev/null || true
+    done
+    # Reap only the close jobs above. A bare wait would also wait for the
+    # Chromium and download server background jobs killed later in cleanup.
+    wait $pids 2>/dev/null || true
+}
 cleanup() {
+    # Close sessions first so their daemons exit on their own. Daemons
+    # attached via --cdp do not idle-exit, so killing alone piles up
+    # replacements on the next run.
+    close_sessions a b c
     pkill -f "user-data-dir=$TPROF" 2>/dev/null || true
     if [ -n "${CHROME_FRESH_PID:-}" ]; then
         kill -9 "$CHROME_FRESH_PID" 2>/dev/null || true

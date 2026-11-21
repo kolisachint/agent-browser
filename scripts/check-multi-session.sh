@@ -45,11 +45,32 @@ now_ms() { # milliseconds; EPOCHREALTIME on bash 5+, else python3
     python3 -c 'import time; print(int(time.time()*1000))'
   fi
 }
+close_sessions() { # close_sessions <s...>: best effort bounded session close
+  local pids="" s pid
+  [ -x "$BIN" ] || return 0
+  [ -d "$TMP/socks" ] || return 0
+  for s in "$@"; do
+    AGENT_BROWSER_SOCKET_DIR="$TMP/socks" "$BIN" --session "$s" close >/dev/null 2>&1 &
+    pids="$pids $!"
+  done
+  local deadline=$((SECONDS + 90))
+  for pid in $pids; do
+    while kill -0 "$pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+    kill -9 "$pid" 2>/dev/null || true
+  done
+  # Reap only the close jobs above. A bare wait would also wait for the
+  # Chromium and download server background jobs killed later in cleanup.
+  wait $pids 2>/dev/null || true
+}
 cleanup() {
-  [ -f "$TMP/chrome.pid" ] && kill "$(cat "$TMP/chrome.pid")" 2>/dev/null
-  [ -f "$TMP/http.pid" ] && kill "$(cat "$TMP/http.pid")" 2>/dev/null
-  for f in "$TMP"/socks/*.pid; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; done
-  [ "$KEEP" = 0 ] && rm -rf "$TMP"
+  # Close sessions first so their daemons exit on their own. Daemons
+  # attached via --cdp do not idle-exit, so killing alone piles up
+  # replacements on the next run.
+  close_sessions s1 s2 s3 s4 s5 s6 s7 s8
+  [ -f "$TMP/chrome.pid" ] && kill "$(cat "$TMP/chrome.pid")" 2>/dev/null || true
+  [ -f "$TMP/http.pid" ] && kill "$(cat "$TMP/http.pid")" 2>/dev/null || true
+  for f in "$TMP"/socks/*.pid; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null || true; done
+  [ "$KEEP" = 0 ] && rm -rf "$TMP" || true
 }
 trap cleanup EXIT
 
@@ -116,7 +137,7 @@ cat > "$TMP/www/grandchild.html" <<'EOF'
 <!doctype html><html><body><h1>grandchild</h1></body></html>
 EOF
 HTTPPORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
-(cd "$TMP/www" && nohup python3 -m http.server "$HTTPPORT" >/dev/null 2>&1 & echo $! > "$TMP/http.pid")
+nohup python3 -m http.server "$HTTPPORT" --directory "$TMP/www" >/dev/null 2>&1 & echo $! > "$TMP/http.pid"
 PAGE="http://localhost:$HTTPPORT/"
 sleep 1
 
