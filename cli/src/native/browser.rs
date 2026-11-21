@@ -1176,6 +1176,7 @@ impl BrowserManager {
                     "Target.createTarget",
                     &CreateTargetParams {
                         url: "about:blank".to_string(),
+                        browser_context_id: None,
                     },
                     None,
                 )
@@ -1480,6 +1481,7 @@ impl BrowserManager {
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: "about:blank".to_string(),
+                    browser_context_id: self.browser_context_id.clone(),
                 },
                 None,
             )
@@ -2217,6 +2219,7 @@ impl BrowserManager {
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: "about:blank".to_string(),
+                    browser_context_id: self.browser_context_id.clone(),
                 },
                 None,
             )
@@ -2562,6 +2565,7 @@ impl BrowserManager {
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: target_url.to_string(),
+                    browser_context_id: self.browser_context_id.clone(),
                 },
                 None,
             )
@@ -3880,6 +3884,93 @@ mod tests {
         let client = CdpClient::connect(&url).await.unwrap();
         let mgr = BrowserManager::for_test(client, url);
         assert_eq!(mgr.browser_identity().await, None);
+    }
+
+    /// Starts a mock browser-level CDP endpoint that records the params of
+    /// every `Target.createTarget` call and answers the attach and domain
+    /// commands `tab_new` needs.
+    async fn start_mock_cdp_recording_create_target(
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_task = recorded.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/MOCK-BROWSER-ID",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let ws = match tokio_tungstenite::accept_async(stream).await {
+                Ok(ws) => ws,
+                Err(_) => return,
+            };
+            let (mut tx, mut rx) = ws.split();
+            while let Some(Ok(msg)) = rx.next().await {
+                let text = match msg {
+                    Message::Text(t) => t,
+                    _ => continue,
+                };
+                let cmd: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(id) = cmd["id"].as_u64() else {
+                    continue;
+                };
+                if cmd["method"] == "Target.createTarget" {
+                    recorded_task.lock().unwrap().push(cmd["params"].clone());
+                }
+                let reply = if cmd["method"] == "Target.attachToTarget" {
+                    json!({ "id": id, "result": { "sessionId": "S-1" } })
+                } else if cmd["method"] == "Target.createTarget" {
+                    json!({ "id": id, "result": { "targetId": "T-NEW" } })
+                } else {
+                    json!({ "id": id, "result": {} })
+                };
+                if tx.send(Message::Text(reply.to_string())).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (url, recorded)
+    }
+
+    /// Tabs a session opens must land in its own browser context when
+    /// `window new` created one; otherwise an own-window session's `tab
+    /// new` tabs fall back to the default context and their downloads
+    /// escape the session's download folder.
+    #[tokio::test]
+    async fn tab_new_uses_the_sessions_own_browser_context() {
+        let (url, recorded) = start_mock_cdp_recording_create_target().await;
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mut mgr = BrowserManager::for_test(client, url);
+        mgr.set_browser_context_id(Some("CTX-OWN".to_string()));
+        mgr.tab_new(Some("https://example.com/"), None)
+            .await
+            .unwrap();
+        let params = recorded.lock().unwrap().clone();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0]["url"], "https://example.com/");
+        assert_eq!(params[0]["browserContextId"], "CTX-OWN");
+    }
+
+    #[tokio::test]
+    async fn tab_new_without_an_own_context_omits_browser_context_id() {
+        let (url, recorded) = start_mock_cdp_recording_create_target().await;
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mut mgr = BrowserManager::for_test(client, url);
+        mgr.tab_new(Some("https://example.com/"), None)
+            .await
+            .unwrap();
+        let params = recorded.lock().unwrap().clone();
+        assert_eq!(params.len(), 1);
+        assert!(params[0].get("browserContextId").is_none());
     }
 
     fn free_local_port() -> u16 {
