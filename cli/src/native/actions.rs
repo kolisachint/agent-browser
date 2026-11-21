@@ -453,6 +453,58 @@ fn prune_download_frames(frames: &mut HashMap<String, String>, event: &CdpEvent)
     }
 }
 
+/// Resolve the owner target of a download event while the owning tab is
+/// still tracked: a top-level frame id equals its target id, otherwise the
+/// frame index resolves the owner session to a target. Must run when the
+/// download is first observed — a `target=_blank` popup closes when its
+/// navigation turns into a download, so resolving at claim time finds
+/// nothing. `None` means the owner could not be resolved (another session's
+/// download, or an event that carries neither frame nor session).
+fn resolve_download_owner(
+    mgr: &BrowserManager,
+    frames: &HashMap<String, String>,
+    params: &Value,
+    session: Option<&str>,
+) -> Option<String> {
+    let frame_id = params.get("frameId").and_then(Value::as_str);
+    if let Some(frame) = frame_id {
+        if mgr.has_target(frame) {
+            return Some(frame.to_string());
+        }
+    }
+    let owner_session =
+        session.or_else(|| frame_id.and_then(|frame| frames.get(frame).map(String::as_str)))?;
+    mgr.target_id_for_session(owner_session).map(str::to_string)
+}
+
+/// Feed one CDP event through the download frame index and ledger,
+/// resolving the owner target while the owning tab is still tracked.
+/// Returns true when the event was a download event. Takes the state
+/// pieces (not `&mut DaemonState`) so the drain loop can call it while it
+/// holds the event receiver borrow.
+fn observe_download_event(
+    browser: Option<&BrowserManager>,
+    frames: &mut HashMap<String, String>,
+    downloads: &mut DownloadLedger,
+    event: &CdpEvent,
+) -> bool {
+    note_download_frame(frames, event);
+    prune_download_frames(frames, event);
+    let owner = browser.and_then(|mgr| {
+        (event.method == "Browser.downloadWillBegin" || event.method == "Page.downloadWillBegin")
+            .then(|| {
+                resolve_download_owner(mgr, frames, &event.params, event.session_id.as_deref())
+            })
+            .flatten()
+    });
+    downloads.observe_with_owner(
+        &event.method,
+        &event.params,
+        event.session_id.as_deref(),
+        owner,
+    )
+}
+
 /// Rebuild the in-memory attach target from a persisted CDP endpoint: a
 /// bare port round-trips the `CdpPort` form, anything else the `CdpUrl` form.
 fn attached_target_from_endpoint(endpoint: &str) -> AttachedTarget {
@@ -1981,12 +2033,11 @@ impl DaemonState {
         loop {
             match rx.try_recv() {
                 Ok(event) => {
-                    note_download_frame(&mut self.download_frames, &event);
-                    prune_download_frames(&mut self.download_frames, &event);
-                    if self.downloads.observe(
-                        &event.method,
-                        &event.params,
-                        event.session_id.as_deref(),
+                    if observe_download_event(
+                        self.browser.as_ref(),
+                        &mut self.download_frames,
+                        &mut self.downloads,
+                        &event,
                     ) {
                         continue;
                     }
@@ -13112,11 +13163,12 @@ async fn handle_waitfordownload(cmd: &Value, state: &mut DaemonState) -> Result<
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(event)) => {
-                note_download_frame(&mut state.download_frames, &event);
-                prune_download_frames(&mut state.download_frames, &event);
-                state
-                    .downloads
-                    .observe(&event.method, &event.params, event.session_id.as_deref());
+                observe_download_event(
+                    state.browser.as_ref(),
+                    &mut state.download_frames,
+                    &mut state.downloads,
+                    &event,
+                );
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(_)) => return Err("Event stream closed".to_string()),
@@ -13180,13 +13232,23 @@ fn guid_download_path(download_dir: &std::path::Path, guid: &str) -> Result<Path
 /// equals its target id; otherwise the frame index resolves the owner session
 /// to a target. Strict sessions (pinned or own-window) take only downloads
 /// owned by their owned targets and never unresolvable ones; legacy sessions
-/// keep the old claim-anything behavior.
+/// keep the old claim-anything behavior. The owner is read from the record
+/// (resolved when the download began) and a just-closed owned tab still
+/// counts via the manager's recently-removed set, so a `target=_blank`
+/// popup that closed mid-download is still claimed by its opener. Records
+/// observed before the owner was stored fall back to live resolution.
 fn claim_owned_download(state: &mut DaemonState) -> Option<DownloadRecord> {
     let mgr = state.browser.as_ref()?;
     let strict = mgr.pin_tab() || mgr.own_window();
     let owned: std::collections::HashSet<String> = mgr.owned_targets().clone();
     let frames = &state.download_frames;
     state.downloads.claim_finished_where(|record| {
+        if let Some(stored) = record.owner_target.as_deref() {
+            if !strict {
+                return true;
+            }
+            return mgr.is_owned_or_recently_removed(stored);
+        }
         let owner_target: Option<String> = record
             .frame_id
             .as_deref()
@@ -17212,6 +17274,150 @@ mod tests {
             },
         );
         assert!(!frames.contains_key("F3"));
+    }
+
+    /// A `target=_blank` download: Chrome adopts the blank popup into the
+    /// opener session's owned targets, then closes it when the navigation
+    /// turns into a download — before `wait --download` claims. The opener
+    /// must still claim it (owner resolved at willBegin time plus the
+    /// recently-removed owned set); a strict session that never owned the
+    /// popup must not.
+    #[tokio::test]
+    async fn strict_wait_claims_popup_download_after_popup_closed() {
+        use super::super::browser::PageInfo;
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        async fn mock_client() -> (crate::native::cdp::client::CdpClient, String) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                if let Ok((stream, _)) = listener.accept().await {
+                    if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                        while let Some(Ok(Message::Text(text))) = ws.next().await {
+                            let cmd: Value =
+                                serde_json::from_str(&text).unwrap_or(serde_json::json!({}));
+                            let reply = serde_json::json!({ "id": cmd["id"], "result": {} });
+                            if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            let client = crate::native::cdp::client::CdpClient::connect(&url)
+                .await
+                .unwrap();
+            (client, url)
+        }
+
+        fn page_info(tab_id: u32, target_id: &str, session_id: &str) -> PageInfo {
+            PageInfo {
+                tab_id,
+                label: None,
+                target_id: target_id.to_string(),
+                session_id: session_id.to_string(),
+                url: "https://example.com/".to_string(),
+                title: String::new(),
+                target_type: "page".to_string(),
+            }
+        }
+
+        const OPENER: &str = "OPENER0000000000000000000000000001";
+        const OPENER_SESSION: &str = "OPENERSESSION00000000000000000001";
+        const POPUP: &str = "POPUP000000000000000000000000000002";
+        const POPUP_SESSION: &str = "POPUPSESSION000000000000000000001";
+        const OTHER: &str = "OTHER000000000000000000000000000003";
+        const OTHER_SESSION: &str = "OTHERSESSION0000000000000000000003";
+
+        fn will_begin() -> CdpEvent {
+            CdpEvent {
+                method: "Browser.downloadWillBegin".to_string(),
+                params: serde_json::json!({ "guid": "popup-guid", "frameId": POPUP }),
+                session_id: None,
+            }
+        }
+
+        fn progress() -> CdpEvent {
+            CdpEvent {
+                method: "Browser.downloadProgress".to_string(),
+                params: serde_json::json!({
+                    "guid": "popup-guid",
+                    "state": "completed",
+                    "filePath": "/tmp/popup-guid",
+                }),
+                session_id: None,
+            }
+        }
+
+        // The opener session: owns the opener tab, adopts the blank popup.
+        // One env guard for both states: `isolated_state` holds a
+        // process-global env mutex, so a second call would deadlock.
+        let (_env, mut opener) = isolated_state();
+        let mut other = super::DaemonState::new();
+        other.session_id = "strict-other-session".to_string();
+        let (client, url) = mock_client().await;
+        let mut mgr = super::BrowserManager::for_test(client, url);
+        mgr.set_pin_tab(true);
+        mgr.add_page(page_info(1, OPENER, OPENER_SESSION));
+        assert!(mgr.register_discovered_page(
+            POPUP,
+            POPUP_SESSION,
+            "https://example.com/file".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(OPENER),
+        ));
+        opener.browser = Some(mgr);
+
+        // The download begins while the popup is still owned: the owner is
+        // resolved right then. Chrome then closes the popup.
+        assert!(super::observe_download_event(
+            opener.browser.as_ref(),
+            &mut opener.download_frames,
+            &mut opener.downloads,
+            &will_begin(),
+        ));
+        opener
+            .browser
+            .as_mut()
+            .unwrap()
+            .remove_page_by_target_id(POPUP);
+        assert!(super::observe_download_event(
+            opener.browser.as_ref(),
+            &mut opener.download_frames,
+            &mut opener.downloads,
+            &progress(),
+        ));
+
+        let record = super::claim_owned_download(&mut opener)
+            .expect("the opener claims its popup download after the popup closed");
+        assert_eq!(record.guid, "popup-guid");
+
+        // Another strict session sees the same browser events but never
+        // owned the popup: it claims nothing.
+        let (client_other, url_other) = mock_client().await;
+        let mut other_mgr = super::BrowserManager::for_test(client_other, url_other);
+        other_mgr.set_pin_tab(true);
+        other_mgr.add_page(page_info(1, OTHER, OTHER_SESSION));
+        other.browser = Some(other_mgr);
+
+        assert!(super::observe_download_event(
+            other.browser.as_ref(),
+            &mut other.download_frames,
+            &mut other.downloads,
+            &will_begin(),
+        ));
+        assert!(super::observe_download_event(
+            other.browser.as_ref(),
+            &mut other.download_frames,
+            &mut other.downloads,
+            &progress(),
+        ));
+        assert!(
+            super::claim_owned_download(&mut other).is_none(),
+            "a strict session that never owned the popup claims nothing"
+        );
     }
 
     #[tokio::test]

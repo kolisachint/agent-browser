@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -766,10 +766,20 @@ pub struct BrowserManager {
     /// restored binding, adopted popups, transitively). Popup ownership is
     /// decided by this set.
     owned_targets: HashSet<String>,
+    /// Owned targets that just closed, most-recent last. A `target=_blank`
+    /// popup closes when its navigation turns into a download, before
+    /// `wait --download` claims; a download whose stored owner is in here
+    /// still counts as owned by this session. Bounded. Boxed so the
+    /// manager stays small for the launch-path futures (one launch test
+    /// runs at the stack edge in unoptimized builds).
+    #[allow(clippy::box_collection)]
+    recently_removed_owned: Box<VecDeque<String>>,
     /// Discovered targets skipped as foreign (popup of another session, or a
     /// descendant of one). Bounded; keeps grandchildren of foreign popups
-    /// foreign after the parent was never tracked.
-    skipped_targets: HashSet<String>,
+    /// foreign after the parent was never tracked. Boxed like
+    /// `recently_removed_owned` to keep the manager small.
+    #[allow(clippy::box_collection)]
+    skipped_targets: Box<HashSet<String>>,
     /// CDP target id of the tab this session is bound to. Updated whenever
     /// the session creates a tab or explicitly switches tabs; persisted by
     /// the daemon so re-attach selects the same tab instead of index 0.
@@ -994,7 +1004,8 @@ impl BrowserManager {
                 browser_context_id: None,
                 browser_id: None,
                 owned_targets: HashSet::new(),
-                skipped_targets: HashSet::new(),
+                skipped_targets: Box::new(HashSet::new()),
+                recently_removed_owned: Box::new(VecDeque::new()),
                 bound_target_id: None,
                 bound_target_gone: None,
                 wedge_suspect: None,
@@ -1110,7 +1121,8 @@ impl BrowserManager {
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
-            skipped_targets: HashSet::new(),
+            skipped_targets: Box::new(HashSet::new()),
+            recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -1439,8 +1451,10 @@ impl BrowserManager {
         let was_bound = self.bound_target_id.as_deref() == Some(target_id.as_str());
         self.tab_keep.remove(&target_id);
         // The replacement tab is created by this session (see below), so it
-        // inherits ownership of the tab it replaces.
+        // inherits ownership of the tab it replaces. The replaced id is
+        // still remembered so a download it started keeps its owner.
         if self.owned_targets.remove(target_id.as_str()) {
+            self.remember_removed_owned(target_id.as_str());
             self.owned_targets.insert(replacement.0.clone());
         }
         let page = &mut self.pages[self.active_page_index];
@@ -1766,6 +1780,36 @@ impl BrowserManager {
             }
         }
         self.skipped_targets.insert(target_id.to_string());
+    }
+
+    /// Remember a just-closed owned target so a download whose owner was
+    /// resolved while the tab was alive still counts as owned after the
+    /// tab closes (a `target=_blank` download popup closes itself).
+    /// Bounded: the oldest entry is dropped past the cap.
+    fn remember_removed_owned(&mut self, target_id: &str) {
+        const MAX_RECENTLY_REMOVED_OWNED: usize = 64;
+        if let Some(pos) = self
+            .recently_removed_owned
+            .iter()
+            .position(|entry| entry == target_id)
+        {
+            self.recently_removed_owned.remove(pos);
+        }
+        self.recently_removed_owned.push_back(target_id.to_string());
+        while self.recently_removed_owned.len() > MAX_RECENTLY_REMOVED_OWNED {
+            self.recently_removed_owned.pop_front();
+        }
+    }
+
+    /// Whether `target_id` is owned by this session now or closed recently
+    /// while owned. Strict download claims accept either; anything else
+    /// belongs to another session (or was never owned).
+    pub fn is_owned_or_recently_removed(&self, target_id: &str) -> bool {
+        self.owned_targets.contains(target_id)
+            || self
+                .recently_removed_owned
+                .iter()
+                .any(|entry| entry == target_id)
     }
 
     /// The target id this session is bound to, if any.
@@ -2160,7 +2204,8 @@ impl BrowserManager {
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
-            skipped_targets: HashSet::new(),
+            skipped_targets: Box::new(HashSet::new()),
+            recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -2764,7 +2809,9 @@ impl BrowserManager {
 
         let page = self.pages.remove(target_index);
         self.tab_keep.remove(&page.target_id);
-        self.owned_targets.remove(&page.target_id);
+        if self.owned_targets.remove(&page.target_id) {
+            self.remember_removed_owned(&page.target_id);
+        }
         self.update_active_page_after_removal(target_index);
         let closed_tab_id = page.tab_id;
         let closed_label = page.label.clone();
@@ -3170,7 +3217,9 @@ impl BrowserManager {
     pub fn remove_page_by_target_id(&mut self, target_id: &str) {
         if let Some(pos) = self.pages.iter().position(|p| p.target_id == target_id) {
             let page = self.pages.remove(pos);
-            self.owned_targets.remove(&page.target_id);
+            if self.owned_targets.remove(&page.target_id) {
+                self.remember_removed_owned(&page.target_id);
+            }
             self.tab_keep.remove(target_id);
             self.update_active_page_after_removal(pos);
             // If the destroyed target was the bound tab (closed externally,
@@ -3520,7 +3569,8 @@ async fn initialize_lightpanda_manager(
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
-            skipped_targets: HashSet::new(),
+            skipped_targets: Box::new(HashSet::new()),
+            recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -3637,7 +3687,8 @@ async fn initialize_obscura_manager(
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
-            skipped_targets: HashSet::new(),
+            skipped_targets: Box::new(HashSet::new()),
+            recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -4788,7 +4839,8 @@ mod tests {
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
-            skipped_targets: HashSet::new(),
+            skipped_targets: Box::new(HashSet::new()),
+            recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -4856,7 +4908,8 @@ mod tests {
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
-            skipped_targets: HashSet::new(),
+            skipped_targets: Box::new(HashSet::new()),
+            recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -5538,6 +5591,37 @@ mod tests {
         assert_eq!(tabs.len(), 1, "only the owned tab is listed");
         assert_eq!(tabs[0]["targetId"], TARGET_A);
         assert_eq!(tabs[0]["active"], true);
+    }
+
+    /// A just-closed owned tab still counts as owned (bounded): a
+    /// `target=_blank` download popup closes itself before `wait
+    /// --download` claims, and the opener's stored owner must still match.
+    #[tokio::test]
+    async fn test_closed_owned_tab_still_counts_as_owned() {
+        let mut mgr = test_manager(vec![
+            page(1, TARGET_A, "https://mine.example"),
+            page(2, TARGET_B, "https://mine.example/popup"),
+        ])
+        .await;
+        mgr.set_pin_tab(true);
+        mgr.set_owned_targets(
+            [TARGET_A.to_string(), TARGET_B.to_string()]
+                .into_iter()
+                .collect(),
+        );
+
+        mgr.remove_page_by_target_id(TARGET_B);
+
+        assert!(!mgr.owned_targets().contains(TARGET_B));
+        assert!(
+            mgr.is_owned_or_recently_removed(TARGET_B),
+            "a just-closed owned popup still counts as owned"
+        );
+        assert!(mgr.is_owned_or_recently_removed(TARGET_A));
+        assert!(
+            !mgr.is_owned_or_recently_removed("NEVEROWNED000000000000000000000000"),
+            "a target that was never owned is not owned"
+        );
     }
 
     /// A legacy session keeps listing every tracked tab.

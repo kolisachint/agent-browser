@@ -31,6 +31,13 @@ pub struct DownloadRecord {
     /// Frame that started the download, from either willBegin event. Used to
     /// attribute sessionless `Browser.*` events via a frame-to-session index.
     pub frame_id: Option<String>,
+    /// Owner target resolved when the download was first observed: a
+    /// top-level frame id equals its target id, otherwise the frame index
+    /// resolves the owner session to a target. A `target=_blank` popup
+    /// closes when its navigation turns into a download, so resolving the
+    /// owner at claim time finds nothing; the stored owner survives the
+    /// removal (see `BrowserManager::is_owned_or_recently_removed`).
+    pub owner_target: Option<String>,
 }
 
 /// How many download records the ledger keeps. Sessions sharing one browser
@@ -57,8 +64,26 @@ impl DownloadLedger {
     /// `session` is the CDP session the event arrived on, if any:
     /// `Browser.*` events are sessionless, while `Page.*` events arrive on
     /// the session attached to the downloading frame and identify the owning
-    /// tab. Returns false for any other method.
+    /// tab. Returns false for any other method. The caller resolves
+    /// `owner_target` (top-level frame id equals its target id, else the
+    /// frame index resolves the owner session to a target) while the owning
+    /// tab is still tracked; it is stored on the record so the claim still
+    /// owns the download after a `target=_blank` popup closes.
     pub fn observe(&mut self, method: &str, params: &Value, session: Option<&str>) -> bool {
+        self.observe_with_owner(method, params, session, None)
+    }
+
+    /// `observe` with the owner target resolved by the caller at willBegin
+    /// time. The stored owner is set once (the first non-`None` resolution
+    /// wins) and never clobbered by later ownerless events, so a popup
+    /// that closes mid-download keeps its owner.
+    pub fn observe_with_owner(
+        &mut self,
+        method: &str,
+        params: &Value,
+        session: Option<&str>,
+        owner_target: Option<String>,
+    ) -> bool {
         let Some(guid) = params.get("guid").and_then(|v| v.as_str()) else {
             return false;
         };
@@ -75,6 +100,9 @@ impl DownloadLedger {
                 }
                 if record.frame_id.is_none() {
                     record.frame_id = frame_id;
+                }
+                if record.owner_target.is_none() {
+                    record.owner_target = owner_target;
                 }
                 true
             }
@@ -160,6 +188,7 @@ impl DownloadLedger {
             claimed: false,
             page_session: None,
             frame_id: None,
+            owner_target: None,
         });
         self.records.last_mut().expect("record was just pushed")
     }
@@ -406,6 +435,30 @@ mod tests {
         let owned: HashSet<String> = ["target-a".to_string()].into_iter().collect();
         assert!(download_is_owned(Some("target-a"), &owned, true));
         assert!(!download_is_owned(Some("target-b"), &owned, true));
+    }
+
+    #[test]
+    fn stored_owner_survives_ownerless_events_after_the_popup_closes() {
+        let mut ledger = DownloadLedger::default();
+        ledger.observe_with_owner(
+            "Browser.downloadWillBegin",
+            &json!({ "guid": "g", "frameId": "POPUP" }),
+            None,
+            Some("POPUP".to_string()),
+        );
+        // The popup closes before progress arrives: ownerless events must
+        // not clobber the stored owner.
+        ledger.observe_with_owner(
+            "Browser.downloadProgress",
+            &json!({ "guid": "g", "state": "completed", "filePath": "/dl/g.bin" }),
+            None,
+            None,
+        );
+        let owned: HashSet<String> = ["POPUP".to_string()].into_iter().collect();
+        let record = ledger
+            .claim_finished_where(|r| download_is_owned(r.owner_target.as_deref(), &owned, true))
+            .expect("stored owner still owned");
+        assert_eq!(record.owner_target.as_deref(), Some("POPUP"));
     }
 
     #[test]
