@@ -3090,8 +3090,9 @@ impl BrowserManager {
     /// Single decision point for both CDP target drains
     /// (`Target.attachedToTarget` and `Target.targetCreated`). A tracked
     /// target only has its metadata refreshed; a new one is appended and
-    /// activated per pin mode: a pinned session never lets a discovered tab
-    /// steal the active tab or pin binding, a legacy session follows it.
+    /// activated per background mode: a background session (pinned to its
+    /// tab, or living in its own window) never lets a discovered tab steal
+    /// the active tab or pin binding, a legacy session follows it.
     /// Popups opened by another session's tab are ignored (see
     /// `should_adopt_discovered_target`). Explicit commands (`tab new`,
     /// `window new`, `click --new-tab`) take their own `add_page` path.
@@ -3118,10 +3119,15 @@ impl BrowserManager {
                 return false;
             }
         }
+        let is_popup = opener_id.is_some_and(|s| !s.is_empty());
         let tab_id = self.assign_tab_id();
-        // Pinned sessions never activate a discovered tab (strict no-steal);
-        // legacy sessions follow it, matching pre-pin behavior.
-        let activate = !self.pin_tab;
+        // Background sessions (pinned to their tab, or living in their own
+        // window) never activate a discovered tab: following it would move
+        // the session-local pointer out of its own window into another
+        // session's tab, so other sessions' `window new` tabs would steal
+        // this session's active tab. Legacy sessions follow it, matching
+        // pre-pin behavior.
+        let activate = !self.background_mode();
         self.add_page_with_activation(
             PageInfo {
                 tab_id,
@@ -3134,6 +3140,14 @@ impl BrowserManager {
             },
             activate,
         );
+        // An adopted popup becomes this session's own tab: popups it opens
+        // in turn carry its id as opener and must route back here even
+        // while it sits idle in the background. Root targets without an
+        // opener are not claimed: every session sharing the browser tracks
+        // those, so owning them here would break popup isolation.
+        if is_popup {
+            self.owned_targets.insert(target_id.to_string());
+        }
         true
     }
 
@@ -5485,6 +5499,35 @@ mod tests {
         assert!(mgr.has_target(popup));
     }
 
+    /// An own-window session never follows a discovered root tab either:
+    /// activating it would move the session-local pointer out of its own
+    /// window into another session's tab. Force-red: gate activation on
+    /// `pin_tab` only and the active tab is stolen.
+    #[tokio::test]
+    async fn test_register_discovered_page_own_window_ignores_foreign_tab() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_own_window(true);
+        assert!(mgr.restore_target_binding(TARGET_A, "https://mine.example"));
+
+        let newly_added = mgr.register_discovered_page(
+            TARGET_B,
+            "session-b",
+            "https://other.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            None,
+        );
+
+        assert!(newly_added, "the tab is still tracked");
+        assert!(mgr.has_target(TARGET_B));
+        assert_eq!(
+            mgr.active_target_id().unwrap(),
+            TARGET_A,
+            "an own-window session must not follow another session's tab"
+        );
+        assert_eq!(mgr.bound_target_id(), Some(TARGET_A));
+    }
+
     /// An empty opener id behaves like no opener: the target is adopted.
     #[tokio::test]
     async fn test_register_discovered_page_empty_opener_adopts() {
@@ -5502,6 +5545,43 @@ mod tests {
 
         assert!(newly_added, "an empty opener id must not block adoption");
         assert!(mgr.has_target(TARGET_B));
+    }
+
+    /// An adopted popup becomes this session's own tab: a popup opened
+    /// from it is adopted here even while the first popup sits idle in
+    /// the background. Force-red: without claiming adopted popups, the
+    /// second popup's opener is tracked but unowned, so it is ignored.
+    #[tokio::test]
+    async fn test_register_discovered_page_adopts_popup_of_adopted_popup() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_pin_tab(true);
+
+        let popup = "EEEE0000BBBB1111CCCC2222DDDD3333";
+        assert!(mgr.register_discovered_page(
+            popup,
+            "session-popup",
+            "https://popup.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(TARGET_A),
+        ));
+        assert!(mgr.owns_opener(popup));
+
+        let nested = "FFFF1111CCCC2222DDDD3333EEEE4444";
+        let newly_added = mgr.register_discovered_page(
+            nested,
+            "session-nested",
+            "https://nested.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(popup),
+        );
+
+        assert!(
+            newly_added,
+            "a popup from an adopted popup must stay with its owner"
+        );
+        assert!(mgr.has_target(nested));
     }
 
     #[tokio::test]
