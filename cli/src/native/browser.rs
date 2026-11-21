@@ -1682,13 +1682,28 @@ impl BrowserManager {
     /// `Browser.getVersion` never reports that URL, so the command is only a
     /// liveness probe: `None` when the endpoint does not answer (proxied
     /// connections), in which case no identity is persisted and no refusal
-    /// is enforced.
+    /// is enforced. The first command to a just-started browser can fail
+    /// while its session handling initializes, so fast failures are retried
+    /// within a bounded budget instead of silently adopting a browser that
+    /// should have been refused.
     pub async fn browser_identity(&self) -> Option<String> {
-        let _: serde_json::Value = self
-            .client
-            .send_command("Browser.getVersion", None, None)
-            .await
-            .ok()?;
+        let answered = tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                let probe: Result<serde_json::Value, String> = self
+                    .client
+                    .send_command("Browser.getVersion", None, None)
+                    .await;
+                if probe.is_ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !answered {
+            return None;
+        }
         Self::browser_id_from_version_url(&self.ws_url)
     }
 
