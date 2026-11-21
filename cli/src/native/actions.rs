@@ -4167,14 +4167,31 @@ async fn apply_tab_binding_on_attach(state: &mut DaemonState) -> Result<bool, St
         if let Some(context_id) = state.context_snapshot.take() {
             mgr.set_browser_context_id(Some(context_id));
         }
-        // Refuse to continue in a different browser sharing the same port.
-        // The startup snapshot is consumed by the first attach, so later
-        // attaches in the same daemon compare against the persisted binding
-        // instead; either way a mismatch fails before any tab is adopted.
+        // Refuse to continue in a different browser sharing the same port,
+        // but only for a strict session (pinned or own-window) reattaching
+        // through its persisted binding: an explicit --cdp/--auto-connect on
+        // this launch names a new browser on purpose, and a legacy session
+        // follows whatever serves the endpoint. Otherwise accept the new
+        // browser and let the persist below overwrite the stale identity.
+        // The startup snapshot is consumed by the first attach either way,
+        // so later attaches in the same daemon compare against the persisted
+        // binding instead.
+        let explicit_endpoint = matches!(
+            state.settings.connection(),
+            Connection::Cdp(_) | Connection::AutoConnect
+        );
+        let strict = pin || state.own_window;
+        let from_persisted = !explicit_endpoint && state.attached_target.is_some();
         let persisted_id = binding.as_ref().and_then(|b| b.browser_id.clone());
         let current_id = Box::pin(mgr.browser_identity()).await;
         mgr.set_browser_id(current_id.clone());
-        if let Some(expected) = state.browser_snapshot.take().or(persisted_id) {
+        let expected: Option<String> = if !explicit_endpoint && from_persisted && strict {
+            state.browser_snapshot.take().or(persisted_id)
+        } else {
+            let _ = state.browser_snapshot.take();
+            None
+        };
+        if let Some(expected) = expected {
             if let Some(current) = current_id {
                 if current != expected {
                     return Err(format!(
@@ -17487,6 +17504,123 @@ mod tests {
             .expect("the same browser must reattach");
         let binding = load(&state.session_id).unwrap().unwrap();
         assert_eq!(binding.browser_id.as_deref(), Some("BROWSER-SAME"));
+    }
+
+    /// An explicit --cdp on this launch names a new browser on purpose: a
+    /// strict session accepts it instead of refusing until close.
+    #[tokio::test]
+    async fn reattach_accepts_a_different_browser_with_an_explicit_endpoint() {
+        use super::super::tab_binding::{save, TabBinding};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/BROWSER-NEW",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let cmd: Value = serde_json::from_str(&text).unwrap();
+                let id = cmd["id"].clone();
+                let reply = serde_json::json!({ "id": id, "result": {} });
+                if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let (_env, mut state) = isolated_state();
+        state.session_id = "explicit-different-browser".to_string();
+        save(
+            &state.session_id,
+            &TabBinding {
+                target_id: "TABOLD0123456789".to_string(),
+                url: "https://example.com/".to_string(),
+                pinned: false,
+                own_window: true,
+                cdp: Some("19999".to_string()),
+                owned_targets: vec!["TABOLD0123456789".to_string()],
+                browser_context_id: None,
+                browser_id: Some("BROWSER-OLD".to_string()),
+            },
+        )
+        .unwrap();
+        state.own_window = true;
+        // Explicit --cdp on this launch: the endpoint did not come from the
+        // persisted binding.
+        state
+            .settings
+            .set(Key::Cdp, json!("ws://127.0.0.1:19999/devtools/browser/BROWSER-NEW"));
+        state.attached_target = Some(super::AttachedTarget::CdpPort(19999));
+        let client = crate::native::cdp::client::CdpClient::connect(&url)
+            .await
+            .unwrap();
+        state.browser = Some(super::BrowserManager::for_test(client, url));
+        super::apply_tab_binding_on_attach(&mut state)
+            .await
+            .expect("an explicit endpoint must accept a different browser");
+        assert_eq!(
+            state.browser.as_ref().unwrap().browser_id(),
+            Some("BROWSER-NEW")
+        );
+    }
+
+    /// A legacy session follows whatever serves the endpoint: a different
+    /// browser on the same port reattaches without a refusal.
+    #[tokio::test]
+    async fn reattach_accepts_a_different_browser_for_a_legacy_session() {
+        use super::super::tab_binding::{load, save, TabBinding};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/BROWSER-NEW",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let cmd: Value = serde_json::from_str(&text).unwrap();
+                let id = cmd["id"].clone();
+                let reply = serde_json::json!({ "id": id, "result": {} });
+                if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let (_env, mut state) = isolated_state();
+        state.session_id = "legacy-different-browser".to_string();
+        save(
+            &state.session_id,
+            &TabBinding {
+                target_id: "TABOLD0123456789".to_string(),
+                url: "https://example.com/".to_string(),
+                pinned: false,
+                own_window: false,
+                cdp: Some("19999".to_string()),
+                owned_targets: vec!["TABOLD0123456789".to_string()],
+                browser_context_id: None,
+                browser_id: Some("BROWSER-OLD".to_string()),
+            },
+        )
+        .unwrap();
+        // No explicit endpoint: the attach resumes the persisted binding.
+        state.attached_target = Some(super::AttachedTarget::CdpPort(19999));
+        let client = crate::native::cdp::client::CdpClient::connect(&url)
+            .await
+            .unwrap();
+        state.browser = Some(super::BrowserManager::for_test(client, url));
+        super::apply_tab_binding_on_attach(&mut state)
+            .await
+            .expect("a legacy session must accept a different browser");
+        // The stale binding falls back to the live tab and is cleared.
+        assert_eq!(load(&state.session_id).unwrap(), None);
     }
 
     #[tokio::test]
