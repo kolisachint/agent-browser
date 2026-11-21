@@ -100,6 +100,14 @@ impl Connection {
             Connection::Tcp(s) => s.set_write_timeout(dur),
         }
     }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            Connection::Unix(s) => s.set_nonblocking(nonblocking),
+            Connection::Tcp(s) => s.set_nonblocking(nonblocking),
+        }
+    }
 }
 
 /// Get the base directory for socket/pid files.
@@ -1434,22 +1442,42 @@ pub(crate) fn read_timeout_for(cmd: &Value) -> Duration {
     Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
 }
 
+/// One blocking wait inside [`exchange`]. Short slices absorb a spurious
+/// EAGAIN/WouldBlock wakeup (on macOS an SO_RCVTIMEO expiry surfaces as
+/// WouldBlock, not TimedOut) by waiting again instead of failing the
+/// request, without ever resending it. The overall bound stays the
+/// [`read_timeout_for`] deadline passed to `exchange`.
+const READ_SLICE: Duration = Duration::from_secs(1);
+
 fn send_command_once(cmd: &Value, session: &str) -> Result<Response, SendError> {
     let mut json_str = serde_json::to_string(cmd).map_err(|e| SendError::NotSent(e.to_string()))?;
     json_str.push('\n');
 
     let stream = connect(session).map_err(SendError::NotSent)?;
 
-    stream.set_read_timeout(Some(read_timeout_for(cmd))).ok();
+    // A nonblocking inheritance would turn the response read below into an
+    // instant WouldBlock spin; the exchange loop assumes blocking reads.
+    stream.set_nonblocking(false).ok();
+    stream.set_read_timeout(Some(READ_SLICE)).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
-    exchange(stream, json_str.as_bytes())
+    exchange(
+        stream,
+        json_str.as_bytes(),
+        Instant::now() + read_timeout_for(cmd),
+    )
 }
 
 /// Write one request line and read one response line. Unlike write_all, the
 /// write loop tracks whether any byte was accepted, which decides whether a
-/// failure is safe to retry.
-fn exchange<S: Read + Write>(mut stream: S, request: &[u8]) -> Result<Response, SendError> {
+/// failure is safe to retry. The read loop waits past WouldBlock/TimedOut
+/// slices until `deadline`: a cold daemon that is slow to answer must not
+/// fail the request, and the request is never resent.
+fn exchange<S: Read + Write>(
+    mut stream: S,
+    request: &[u8],
+    deadline: Instant,
+) -> Result<Response, SendError> {
     let mut written = 0;
     while written < request.len() {
         let err = match stream.write(&request[written..]) {
@@ -1471,9 +1499,22 @@ fn exchange<S: Read + Write>(mut stream: S, request: &[u8]) -> Result<Response, 
 
     let mut reader = BufReader::new(stream);
     let mut response_line = String::new();
-    reader
-        .read_line(&mut response_line)
-        .map_err(|e| SendError::OutcomeUnknown(format!("Failed to read: {}", e)))?;
+    loop {
+        match reader.read_line(&mut response_line) {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if (e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut)
+                    && Instant::now() < deadline =>
+            {
+                continue;
+            }
+            Err(e) => {
+                return Err(SendError::OutcomeUnknown(format!("Failed to read: {}", e)));
+            }
+        }
+    }
 
     serde_json::from_str(&response_line)
         .map_err(|e| SendError::OutcomeUnknown(format!("Invalid response: {}", e)))
@@ -1585,27 +1626,115 @@ mod tests {
         }
     }
 
+    fn test_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
     #[test]
     fn exchange_classifies_failures_by_whether_bytes_were_written() {
-        let eof = exchange(MockStream::new(""), b"{}\n");
+        let eof = exchange(MockStream::new(""), b"{}\n", test_deadline());
         assert!(matches!(eof, Err(SendError::OutcomeUnknown(_))));
 
-        let garbage = exchange(MockStream::new("garbage\n"), b"{}\n");
+        let garbage = exchange(MockStream::new("garbage\n"), b"{}\n", test_deadline());
         assert!(matches!(garbage, Err(SendError::OutcomeUnknown(_))));
 
         let mut partial = MockStream::new("");
         partial.accept = 1;
-        let partial = exchange(partial, b"{}\n");
+        let partial = exchange(partial, b"{}\n", test_deadline());
         assert!(matches!(partial, Err(SendError::OutcomeUnknown(_))));
 
         let mut blocked = MockStream::new("");
         blocked.accept = 0;
         blocked.write_err = std::io::ErrorKind::WouldBlock;
-        let blocked = exchange(blocked, b"{}\n");
+        let blocked = exchange(blocked, b"{}\n", test_deadline());
         assert!(matches!(blocked, Err(SendError::NotSent(_))));
 
-        let ok = exchange(MockStream::new("{\"success\":true}\n"), b"{}\n");
+        let ok = exchange(
+            MockStream::new("{\"success\":true}\n"),
+            b"{}\n",
+            test_deadline(),
+        );
         assert!(ok.unwrap().success);
+    }
+
+    /// A daemon that answers after more than one read-timeout slice must
+    /// not fail the request: WouldBlock slices wait again until the real
+    /// deadline instead of surfacing EAGAIN as outcome_unknown.
+    #[test]
+    #[cfg(unix)]
+    fn exchange_waits_past_one_read_slice_for_a_slow_reply() {
+        use std::os::unix::net::UnixStream;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(READ_SLICE)).unwrap();
+        let delay = READ_SLICE + Duration::from_millis(500);
+        let responder = thread::spawn(move || {
+            let mut server = server;
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                server.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            thread::sleep(delay);
+            server.write_all(b"{\"success\":true}\n").unwrap();
+            request
+        });
+
+        let started = Instant::now();
+        let response = exchange(
+            client,
+            b"{\"id\":\"1\",\"action\":\"url\"}\n",
+            started + delay + READ_SLICE,
+        )
+        .expect("a reply past one read slice must be awaited, not failed");
+        assert!(response.success);
+        assert!(started.elapsed() >= delay);
+        let request = responder.join().unwrap();
+        assert_eq!(request, b"{\"id\":\"1\",\"action\":\"url\"}\n");
+    }
+
+    /// Past the deadline the read still fails, but the request is written
+    /// exactly once: the loop waits, it never resends.
+    #[test]
+    #[cfg(unix)]
+    fn exchange_gives_up_after_the_deadline_without_resending() {
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let written = Arc::new(AtomicUsize::new(0));
+        let counted = written.clone();
+        let silent = thread::spawn(move || {
+            let mut server = server;
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                server.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            counted.fetch_add(request.len(), Ordering::SeqCst);
+            // Stay silent past the client deadline, then exit.
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let err = exchange(client, b"{}\n", Instant::now() + Duration::from_millis(200));
+        silent.join().unwrap();
+        assert!(
+            matches!(err, Err(SendError::OutcomeUnknown(_))),
+            "a silent daemon must fail after the deadline"
+        );
+        assert_eq!(written.load(Ordering::SeqCst), 3, "request was resent");
     }
 
     fn ok_response() -> Response {
