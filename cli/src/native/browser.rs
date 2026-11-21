@@ -758,8 +758,9 @@ pub struct BrowserManager {
     /// Browser context created by `window new`, if any. Used for per-context
     /// download behavior and persisted so a restart keeps the isolation.
     browser_context_id: Option<String>,
-    /// Identity of the attached browser (from `Browser.getVersion`), used to
-    /// refuse a reattach that landed on a different browser.
+    /// Identity of the attached browser: the browser-target id from the
+    /// `/json/version` `webSocketDebuggerUrl`, used to refuse a reattach
+    /// that landed on a different browser.
     browser_id: Option<String>,
     /// Tabs this session opened itself or adopted (`tab new`, `window new`,
     /// restored binding, adopted popups, transitively). Popup ownership is
@@ -1673,21 +1674,20 @@ impl BrowserManager {
         self.browser_id.as_deref()
     }
 
-    /// Identity of the currently attached browser, from `Browser.getVersion`.
-    /// `None` when the endpoint does not answer (proxied connections).
+    /// Identity of the currently attached browser: the browser-target id at
+    /// the end of the `/json/version` `webSocketDebuggerUrl` (which is the
+    /// WebSocket URL this manager connected through, modulo host and port).
+    /// `Browser.getVersion` never reports that URL, so the command is only a
+    /// liveness probe: `None` when the endpoint does not answer (proxied
+    /// connections), in which case no identity is persisted and no refusal
+    /// is enforced.
     pub async fn browser_identity(&self) -> Option<String> {
-        let version: Result<serde_json::Value, String> = self
+        let _: serde_json::Value = self
             .client
             .send_command("Browser.getVersion", None, None)
-            .await;
-        version
-            .ok()
-            .and_then(|v| {
-                v.get("webSocketDebuggerUrl")
-                    .and_then(|u| u.as_str())
-                    .map(str::to_string)
-            })
-            .and_then(|url| Self::browser_id_from_version_url(&url))
+            .await
+            .ok()?;
+        Self::browser_id_from_version_url(&self.ws_url)
     }
 
     /// Background mode is opt-in via `--pin-tab` only. Background sessions
@@ -3316,10 +3316,12 @@ impl BrowserManager {
         Ok(())
     }
 
-    /// Browser identity for reattach comparison (last segment of the
-    /// `Browser.getVersion` debugger URL).
+    /// Browser identity for reattach comparison: the last path segment of
+    /// the browser WebSocket URL (the browser-target id). Query strings
+    /// and fragments (forwarded `--cdp` params) are not part of the identity.
     pub fn browser_id_from_version_url(url: &str) -> Option<String> {
-        url.rsplit('/')
+        let path = url.split(['?', '#']).next().unwrap_or(url);
+        path.rsplit('/')
             .next()
             .filter(|s| !s.is_empty())
             .map(str::to_string)
@@ -3774,6 +3776,110 @@ mod tests {
             Some("[::1]:9222")
         );
         assert_eq!(cdp_port_address("wss://cdp.example.com/session"), None);
+    }
+
+    #[test]
+    fn browser_id_is_the_last_path_segment_without_query_or_fragment() {
+        assert_eq!(
+            BrowserManager::browser_id_from_version_url(
+                "ws://127.0.0.1:9222/devtools/browser/ABCDEF12"
+            )
+            .as_deref(),
+            Some("ABCDEF12")
+        );
+        assert_eq!(
+            BrowserManager::browser_id_from_version_url(
+                "ws://127.0.0.1:9222/devtools/browser/ABCDEF12?mode=Hello"
+            )
+            .as_deref(),
+            Some("ABCDEF12")
+        );
+        assert_eq!(
+            BrowserManager::browser_id_from_version_url("wss://remote:443/session#frag").as_deref(),
+            Some("session")
+        );
+        assert_eq!(
+            BrowserManager::browser_id_from_version_url("ws://127.0.0.1:9222/"),
+            None
+        );
+    }
+
+    /// A mock browser-level CDP endpoint whose URL carries `browser_id`.
+    /// Answers `Browser.getVersion` with the real Chrome shape (which
+    /// reports no debugger URL), or fails it when `fail_version` is set.
+    async fn start_mock_cdp_version_endpoint(fail_version: bool) -> String {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/MOCK-BROWSER-ID",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let ws = match tokio_tungstenite::accept_async(stream).await {
+                Ok(ws) => ws,
+                Err(_) => return,
+            };
+            let (mut tx, mut rx) = ws.split();
+            while let Some(Ok(msg)) = rx.next().await {
+                let text = match msg {
+                    Message::Text(t) => t,
+                    _ => continue,
+                };
+                let cmd: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(id) = cmd["id"].as_u64() else {
+                    continue;
+                };
+                let reply = if cmd["method"] == "Browser.getVersion" && fail_version {
+                    json!({ "id": id, "error": { "message": "not supported" } })
+                } else {
+                    json!({ "id": id, "result": {
+                        "protocolVersion": "1.3",
+                        "product": "Chrome/142.0.0.0",
+                        "revision": "@ABCDEF",
+                        "userAgent": "mock",
+                        "jsVersion": "1.2.3",
+                    } })
+                };
+                if tx.send(Message::Text(reply.to_string())).await.is_err() {
+                    return;
+                }
+            }
+        });
+        url
+    }
+
+    /// Regression test: real `Browser.getVersion` responses carry no
+    /// debugger URL, so the identity must come from the browser WebSocket
+    /// URL (the `/json/version` `webSocketDebuggerUrl` this manager
+    /// connected through). Deriving it from the command result instead
+    /// yields `None` against real Chromium, so the persisted `browser_id`
+    /// is always null and the different-browser refusal never triggers.
+    #[tokio::test]
+    async fn browser_identity_comes_from_the_browser_websocket_url() {
+        let url = start_mock_cdp_version_endpoint(false).await;
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mgr = BrowserManager::for_test(client, url);
+        assert_eq!(
+            mgr.browser_identity().await.as_deref(),
+            Some("MOCK-BROWSER-ID")
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_identity_is_none_when_version_does_not_answer() {
+        let url = start_mock_cdp_version_endpoint(true).await;
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mgr = BrowserManager::for_test(client, url);
+        assert_eq!(mgr.browser_identity().await, None);
     }
 
     fn free_local_port() -> u16 {
