@@ -1667,6 +1667,20 @@ impl DaemonState {
                     continue;
                 }
             }
+            // A pinned session holds focus emulation on owned tabs only,
+            // but the drain prepares the tab before registering its page:
+            // mark a foreign root target now so `prepare_domains` skips
+            // the emulation for it. An adopted popup keeps it.
+            if let Some(ref mut mgr) = self.browser {
+                if mgr.pin_tab()
+                    && target_info
+                        .opener_id
+                        .as_deref()
+                        .is_none_or(|o| o.is_empty())
+                {
+                    mgr.mark_session_foreign(page_sid);
+                }
+            }
             let filter = self.domain_filter.read().await.clone();
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
             let controls_active = filter.is_some() || has_proxy_creds;
@@ -1822,6 +1836,11 @@ impl DaemonState {
             let controls_active = filter.is_some() || has_proxy_creds;
             let setup_result = if let Some(ref mut mgr) = self.browser {
                 let target_id = te.target_info.target_id.as_str();
+                let foreign_root = te
+                    .target_info
+                    .opener_id
+                    .as_deref()
+                    .is_none_or(|o| o.is_empty());
                 bounded_auto_attached_setup("target", target_id, async {
                     let attach: AttachToTargetResult = mgr
                         .client
@@ -1834,6 +1853,14 @@ impl DaemonState {
                             None,
                         )
                         .await?;
+                    // A pinned session holds focus emulation on owned tabs
+                    // only, but the drain prepares the tab before
+                    // registering its page: mark a foreign root target now
+                    // so `prepare_domains` skips the emulation for it. An
+                    // adopted popup keeps it.
+                    if mgr.pin_tab() && foreign_root {
+                        mgr.mark_session_foreign(&attach.session_id);
+                    }
                     mgr.prepare_domains_pub(&attach.session_id).await?;
                     if controls_active {
                         install_network_controls_for_session(
@@ -19675,6 +19702,84 @@ mod tests {
         .await
         .expect("the live frame should be resumed");
         assert!(!resumed.lock().unwrap().contains(&"S-GONE".to_string()));
+    }
+
+    /// On a pinned session the drain prepares a discovered tab before
+    /// registering its page: a foreign root target must not get focus
+    /// emulation (the drain marks it first), while an adopted popup keeps
+    /// it. Force-red: drop the mark and the foreign session is emulated.
+    #[tokio::test]
+    async fn drain_emulates_owned_popup_but_not_foreign_root() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let emulated = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let emulated_by_server = emulated.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let command: Value = serde_json::from_str(&text).unwrap();
+                if command["method"] == "Emulation.setFocusEmulationEnabled" {
+                    if let Some(session) = command["sessionId"].as_str() {
+                        emulated_by_server.lock().unwrap().push(session.to_string());
+                    }
+                }
+                let reply = if command["method"] == "Target.attachToTarget" {
+                    let target = command["params"]["targetId"].as_str().unwrap_or("");
+                    json!({
+                        "id": command["id"],
+                        "result": { "sessionId": format!("S-{target}") }
+                    })
+                } else {
+                    json!({ "id": command["id"], "result": {} })
+                };
+                if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let mut state = DaemonState::new();
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mut mgr = BrowserManager::for_test(client, url.clone());
+        mgr.set_pin_tab(true);
+        mgr.add_page(super::super::browser::PageInfo {
+            tab_id: 1,
+            label: None,
+            target_id: "O-OPENER".to_string(),
+            session_id: "S-O-OPENER".to_string(),
+            url: "https://example.com/".to_string(),
+            title: String::new(),
+            target_type: "page".to_string(),
+        });
+        state.browser = Some(mgr);
+
+        let mut popup = setup_test_target("T-POPUP", "page");
+        popup.opener_id = Some("O-OPENER".to_string());
+        let drained = DrainedEvents {
+            new_targets: vec![
+                TargetCreatedEvent {
+                    target_info: setup_test_target("T-ROOT", "page"),
+                },
+                TargetCreatedEvent { target_info: popup },
+            ],
+            ..DrainedEvents::default()
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            state.apply_drained_events(drained),
+        )
+        .await
+        .expect("the drain must finish")
+        .unwrap();
+        assert_eq!(
+            *emulated.lock().unwrap(),
+            vec!["S-T-POPUP".to_string()],
+            "only the adopted popup keeps focus emulation"
+        );
     }
 
     fn setup_test_target(target_id: &str, target_type: &str) -> TargetInfo {

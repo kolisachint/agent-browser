@@ -766,6 +766,13 @@ pub struct BrowserManager {
     /// restored binding, adopted popups, transitively). Popup ownership is
     /// decided by this set.
     owned_targets: HashSet<String>,
+    /// Sessions being prepared before their page is registered that must
+    /// not get focus emulation: drained foreign tabs on a pinned session.
+    /// `prepare_domains` runs before `register_discovered_page` in the
+    /// drain, so the page lookup cannot see these yet; the drain marks
+    /// them and registration consumes the mark. At most a drain batch of
+    /// entries lives here at once.
+    foreign_pending_sessions: HashSet<String>,
     /// Owned targets that just closed, most-recent last. A `target=_blank`
     /// popup closes when its navigation turns into a download, before
     /// `wait --download` claims; a download whose stored owner is in here
@@ -1004,6 +1011,7 @@ impl BrowserManager {
                 browser_context_id: None,
                 browser_id: None,
                 owned_targets: HashSet::new(),
+                foreign_pending_sessions: HashSet::new(),
                 skipped_targets: Box::new(HashSet::new()),
                 recently_removed_owned: Box::new(VecDeque::new()),
                 bound_target_id: None,
@@ -1121,6 +1129,7 @@ impl BrowserManager {
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
+            foreign_pending_sessions: HashSet::new(),
             skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
@@ -1325,7 +1334,17 @@ impl BrowserManager {
         self.client
             .send_command_no_params("Page.enable", Some(session_id))
             .await?;
-        if self.pin_tab {
+        // Only on tabs this session owns: drained foreign tabs share the
+        // browser but belong to another session.
+        let foreign = match self.pages.iter().find(|page| page.session_id == session_id) {
+            Some(page) => !self.owned_targets.contains(&page.target_id),
+            // A session id the manager has not registered yet is usually
+            // a tab this session is still creating (`tab_new` prepares
+            // domains before it tracks the page): it is ours, so it keeps
+            // the emulation — unless the drain marked it foreign.
+            None => self.foreign_pending_sessions.contains(session_id),
+        };
+        if self.pin_tab && !foreign {
             // A background window never comes to front, so hold focus
             // emulation on the page: input keeps working and screenshots
             // keep rendering while the window stays behind the others.
@@ -1788,6 +1807,16 @@ impl BrowserManager {
         self.owned_targets = owned;
     }
 
+    /// Mark a session being prepared as foreign before its page is
+    /// registered, so `prepare_domains` skips focus emulation on it.
+    /// The drain calls this for root targets on a pinned session: they
+    /// are prepared before `register_discovered_page` records them, and
+    /// would otherwise look like tabs this session is still creating
+    /// (which keep the emulation). Registration consumes the mark.
+    pub fn mark_session_foreign(&mut self, session_id: &str) {
+        self.foreign_pending_sessions.insert(session_id.to_string());
+    }
+
     fn remember_skipped(&mut self, target_id: &str) {
         const MAX_SKIPPED: usize = 512;
         if self.skipped_targets.len() >= MAX_SKIPPED {
@@ -2220,6 +2249,7 @@ impl BrowserManager {
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
+            foreign_pending_sessions: HashSet::new(),
             skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
@@ -3233,6 +3263,8 @@ impl BrowserManager {
     pub fn remove_page_by_target_id(&mut self, target_id: &str) {
         if let Some(pos) = self.pages.iter().position(|p| p.target_id == target_id) {
             let page = self.pages.remove(pos);
+            self.foreign_pending_sessions
+                .remove(page.session_id.as_str());
             if self.owned_targets.remove(&page.target_id) {
                 self.remember_removed_owned(&page.target_id);
             }
@@ -3291,6 +3323,7 @@ impl BrowserManager {
         target_type: String,
         opener_id: Option<&str>,
     ) -> bool {
+        self.foreign_pending_sessions.remove(session_id);
         if let Some(p) = self.pages.iter_mut().find(|p| p.target_id == target_id) {
             p.url = url;
             p.title = title;
@@ -3585,6 +3618,7 @@ async fn initialize_lightpanda_manager(
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
+            foreign_pending_sessions: HashSet::new(),
             skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
@@ -3703,6 +3737,7 @@ async fn initialize_obscura_manager(
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
+            foreign_pending_sessions: HashSet::new(),
             skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
@@ -4037,9 +4072,7 @@ mod tests {
                         "result": { "protocolVersion": "1.3", "product": "Chrome/120.0" }
                     })
                 };
-                ws.send(Message::Text(reply.to_string()))
-                    .await
-                    .unwrap();
+                ws.send(Message::Text(reply.to_string())).await.unwrap();
             }
         });
         let client = CdpClient::connect(&url).await.unwrap();
@@ -4049,6 +4082,109 @@ mod tests {
                 .await
                 .as_deref(),
             Some("MOCK-BROWSER-ID")
+        );
+    }
+
+    /// Starts a mock browser endpoint that records the session of every
+    /// `Emulation.setFocusEmulationEnabled` call, so tests can prove a
+    /// pinned session holds focus emulation on owned tabs only.
+    async fn start_mock_cdp_recording_focus_sessions(
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let emulated: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let emulated_task = emulated.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/mock",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+            while let Some(Ok(msg)) = rx.next().await {
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Ping(p) => {
+                        let _ = tx.send(Message::Pong(p)).await;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let cmd: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(id) = cmd["id"].as_u64() else {
+                    continue;
+                };
+                let method = cmd["method"].as_str().unwrap_or("");
+                let respond = |result: Value| json!({ "id": id, "result": result }).to_string();
+                if method == "Emulation.setFocusEmulationEnabled" {
+                    if let Some(sid) = cmd.get("sessionId").and_then(|s| s.as_str()) {
+                        emulated_task.lock().unwrap().push(sid.to_string());
+                    }
+                }
+                let reply = match method {
+                    "Target.getTargets" => Some(respond(json!({
+                        "targetInfos": [
+                            { "targetId": "T-ONE", "type": "page", "title": "one",
+                              "url": "https://one.test/", "attached": false },
+                            { "targetId": "T-TWO", "type": "page", "title": "two",
+                              "url": "https://two.test/", "attached": false },
+                        ]
+                    }))),
+                    "Target.attachToTarget" => {
+                        let target = cmd["params"]["targetId"].as_str().unwrap_or("");
+                        Some(respond(json!({ "sessionId": format!("S-{target}") })))
+                    }
+                    _ => Some(respond(json!({}))),
+                };
+                if let Some(r) = reply {
+                    let _ = tx.send(Message::Text(r)).await;
+                }
+            }
+        });
+        (url, emulated)
+    }
+
+    /// A pinned session holds focus emulation on owned tabs only: a
+    /// drained foreign tab shares the browser but belongs to another
+    /// session, so preparing its domains must not emulate focus on it.
+    /// A session the manager has not registered yet is a tab this
+    /// session is still creating, so it keeps the emulation.
+    /// Force-red: emulate unconditionally and the foreign session is
+    /// recorded too.
+    #[tokio::test]
+    async fn test_prepare_domains_pin_emulates_only_owned_tabs() {
+        let (url, emulated) = start_mock_cdp_recording_focus_sessions().await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        // Connect-time setup is not under test.
+        emulated.lock().unwrap().clear();
+        mgr.set_pin_tab(true);
+        mgr.set_owned_targets(["T-ONE".to_string()].into_iter().collect());
+        mgr.prepare_domains_pub("S-T-ONE")
+            .await
+            .expect("prepare owned");
+        mgr.prepare_domains_pub("S-T-TWO")
+            .await
+            .expect("prepare foreign");
+        // A drained foreign tab is prepared before its page is
+        // registered: the drain marks it so it does not look like a tab
+        // this session is still creating.
+        mgr.mark_session_foreign("S-PENDING");
+        mgr.prepare_domains_pub("S-PENDING")
+            .await
+            .expect("prepare marked");
+        mgr.prepare_domains_pub("S-UNKNOWN")
+            .await
+            .expect("prepare unregistered");
+        assert_eq!(
+            *emulated.lock().unwrap(),
+            vec!["S-T-ONE".to_string(), "S-UNKNOWN".to_string()]
         );
     }
 
@@ -4904,6 +5040,7 @@ mod tests {
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
+            foreign_pending_sessions: HashSet::new(),
             skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
@@ -4973,6 +5110,7 @@ mod tests {
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
+            foreign_pending_sessions: HashSet::new(),
             skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
