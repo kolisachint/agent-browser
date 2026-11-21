@@ -99,6 +99,8 @@ With `--pin-tab`:
 
 Chrome throttles a pinned tab that is not the front tab of its window: its timers slow to about one per second and animation frames stop. Run `agent-browser tab keep live` in that session to keep the tab running while it is hidden. See [Background tab modes](/commands#background-tab-modes) for the cost, and for the Chrome flag that gives a browser you started yourself the full timer rate. Switching tabs in a pinned session (or one that owns its window via `window new`) never brings anything to front; focus emulation keeps input and screenshots working in the background.
 
+A popup (a `window.open` call or a `target=_blank` link) is adopted only by the session whose tab opened it: it appears in that session's `tab list` and in no other session's. Switch to it in the owning session to interact with it.
+
 The flag is sticky per session: pass it once and later commands keep the strict semantics. Daemon restarts keep the pin; an explicit close releases it so other sessions can take the tab, and the next pinned command pins again. Pass `--no-pin-tab` to explicitly turn the pin off again. See [Sessions](/sessions) for the multi-session workflow and [Commands](/commands) for tab refs by CDP target id.
 
 The structured <code>lastUrl</code> is emitted only for sanitized HTTP(S) URLs and <code>about:blank</code>. Credentials, query strings, and fragments are removed from HTTP(S) URLs, while opaque URLs such as <code>data:</code> are omitted. Batch JSON exposes the recovery object under <code>result</code>.

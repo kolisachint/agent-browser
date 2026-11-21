@@ -344,7 +344,7 @@ agent-browser tab app                    # switch to app
 agent-browser tab close docs             # close by label
 ```
 
-Labels are never auto-generated, never rewritten on navigation, and must be unique within a session. A label starts with a letter and contains only letters, digits, `-`, or `_`, and cannot use the reserved `t<N>` or `T<N>` tab-id form. Rejected labels preserve the current tab's refs and selected frame. To interact with another tab, switch to it first: the daemon maintains a single active tab, so refs (`@eN`) belong to the tab that was active when the snapshot ran.
+Labels are never auto-generated, never rewritten on navigation, and must be unique within a session. A label starts with a letter and contains only letters, digits, `-`, or `_`, and cannot use the reserved `t<N>` or `T<N>` tab-id form. Rejected labels preserve the current tab's refs and selected frame. To interact with another tab, switch to it first: the daemon maintains a single active tab, so refs (`@eN`) belong to the tab that was active when the snapshot ran. A popup (`window.open`, `target=_blank` link) is adopted only by the session whose tab opened it, so it shows in that session's `tab list` and in no other session's; switch to it there to interact with it.
 
 Tabs opened through `tab new` or `click --new-tab` inherit the session's setup before their first document loads: user agent, `set headers`, `set credentials`, origin-scoped `--headers`, init scripts, `route` rules, and emulation overrides (color scheme, timezone, locale, geolocation, offline). Turning offline mode off or setting headers to `{}` restores the default setup for future tabs.
 

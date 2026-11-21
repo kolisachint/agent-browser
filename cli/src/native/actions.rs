@@ -1518,6 +1518,15 @@ impl DaemonState {
         // Register top-level pages that browser-level auto-attach paused before
         // their first request. Controls must be installed before resuming.
         for (target_info, page_sid) in &drained.attached_page_sessions {
+            // A popup opened by another session's tab belongs to its owner:
+            // resume the auto-attached session and ignore it here, so it
+            // never enters this session's tab list.
+            if let Some(ref mgr) = self.browser {
+                if !mgr.should_adopt_discovered_target(target_info) {
+                    let _ = mgr.resume_if_waiting_pub(page_sid).await;
+                    continue;
+                }
+            }
             let filter = self.domain_filter.read().await.clone();
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
             let controls_active = filter.is_some() || has_proxy_creds;
@@ -1563,13 +1572,15 @@ impl DaemonState {
                     // `Target.targetCreated` handler below: a pinned session
                     // never activates a discovered target (that would steal
                     // the active tab and overwrite its binding); a legacy
-                    // session follows it.
+                    // session follows it. Popups opened by another session's
+                    // tab were filtered out above and never reach this.
                     mgr.register_discovered_page(
                         &target_info.target_id,
                         page_sid,
                         page_url,
                         target_info.title.clone(),
                         target_info.target_type.clone(),
+                        target_info.opener_id.as_deref(),
                     );
 
                     mgr.resume_if_waiting_pub(page_sid).await
@@ -1658,6 +1669,14 @@ impl DaemonState {
 
         // Attach and register new targets
         for te in &drained.new_targets {
+            // A popup opened by another session's tab belongs to its owner:
+            // skip the attach entirely so it never enters this session's
+            // tab list (its owner's daemon adopts it on its own drain).
+            if let Some(ref mgr) = self.browser {
+                if !mgr.should_adopt_discovered_target(&te.target_info) {
+                    continue;
+                }
+            }
             let filter = self.domain_filter.read().await.clone();
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
             let controls_active = filter.is_some() || has_proxy_creds;
@@ -1708,14 +1727,17 @@ impl DaemonState {
                     // `Target.attachedToTarget` handler above, which activates it
                     // only for legacy sessions; a pinned session never adopts a
                     // discovered tab (that steal would also overwrite its
-                    // binding). Explicit commands (`tab new`, `window new`,
-                    // `click --new-tab`) activate via their own paths.
+                    // binding). Popups opened by another session's tab were
+                    // filtered out above and never reach this. Explicit commands
+                    // (`tab new`, `window new`, `click --new-tab`) activate via
+                    // their own paths.
                     mgr.register_discovered_page(
                         &te.target_info.target_id,
                         &attach.session_id,
                         page_url,
                         te.target_info.title.clone(),
                         te.target_info.target_type.clone(),
+                        te.target_info.opener_id.as_deref(),
                     );
                     mgr.resume_if_waiting_pub(&attach.session_id).await
                 })
@@ -18183,6 +18205,7 @@ mod tests {
             url: "https://example.com/".to_string(),
             attached: Some(true),
             browser_context_id: None,
+            opener_id: None,
         }
     }
 

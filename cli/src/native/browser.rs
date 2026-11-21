@@ -756,6 +756,13 @@ pub struct BrowserManager {
     /// mode: no implicit `Page.bringToFront`, with focus emulation held on
     /// so input and screenshots keep working in the background window.
     own_window: bool,
+    /// CDP target ids of tabs this session opened itself (`tab new`,
+    /// `window new`, `click --new-tab`, the first tab of a browser it
+    /// launched, a restored binding). Popups opened from these tabs belong
+    /// to this session even when the tab is neither active nor bound, so a
+    /// popup from the session's own background tab is still adopted here
+    /// and ignored by sessions that merely track the opener.
+    owned_targets: HashSet<String>,
     /// CDP target id of the tab this session is bound to. Updated whenever
     /// the session creates a tab or explicitly switches tabs; persisted by
     /// the daemon so re-attach selects the same tab instead of index 0.
@@ -977,6 +984,7 @@ impl BrowserManager {
                 direct_page: false,
                 pin_tab: false,
                 own_window: false,
+                owned_targets: HashSet::new(),
                 bound_target_id: None,
                 bound_target_gone: None,
                 wedge_suspect: None,
@@ -1089,6 +1097,7 @@ impl BrowserManager {
             direct_page,
             pin_tab: false,
             own_window: false,
+            owned_targets: HashSet::new(),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -1176,12 +1185,15 @@ impl BrowserManager {
             self.pages.push(PageInfo {
                 tab_id,
                 label: None,
-                target_id: result.target_id,
+                target_id: result.target_id.clone(),
                 session_id: attach_result.session_id.clone(),
                 url: "about:blank".to_string(),
                 title: String::new(),
                 target_type: "page".to_string(),
             });
+            // The session created this tab: popups opened from it belong
+            // to this session even before any binding is established.
+            self.owned_targets.insert(result.target_id);
             self.active_page_index = 0;
             self.bind_active_target();
             self.enable_domains(&attach_result.session_id).await?;
@@ -1412,6 +1424,11 @@ impl BrowserManager {
             .await;
         let was_bound = self.bound_target_id.as_deref() == Some(target_id.as_str());
         self.tab_keep.remove(&target_id);
+        // The replacement tab is created by this session (see below), so it
+        // inherits ownership of the tab it replaces.
+        if self.owned_targets.remove(target_id.as_str()) {
+            self.owned_targets.insert(replacement.0.clone());
+        }
         let page = &mut self.pages[self.active_page_index];
         page.url = "about:blank".to_string();
         page.title.clear();
@@ -1711,6 +1728,9 @@ impl BrowserManager {
             self.active_page_index = index;
             self.bound_target_id = Some(target_id.to_string());
             self.bound_target_gone = None;
+            // The restored tab came from this session's own binding file:
+            // it is this session's tab, so its popups belong here.
+            self.owned_targets.insert(target_id.to_string());
             return true;
         }
         self.bound_target_id = None;
@@ -2042,6 +2062,7 @@ impl BrowserManager {
             direct_page: false,
             pin_tab: false,
             own_window: false,
+            owned_targets: HashSet::new(),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -2493,6 +2514,9 @@ impl BrowserManager {
             title: String::new(),
             target_type: "page".to_string(),
         });
+        // Explicitly created by this session (`tab new`, `click --new-tab`):
+        // popups opened from it belong here even when it is not active.
+        self.owned_targets.insert(target_id.clone());
         self.active_page_index = index;
         self.bind_active_target();
 
@@ -2610,6 +2634,7 @@ impl BrowserManager {
 
         let page = self.pages.remove(target_index);
         self.tab_keep.remove(&page.target_id);
+        self.owned_targets.remove(&page.target_id);
         self.update_active_page_after_removal(target_index);
         let closed_tab_id = page.tab_id;
         let closed_label = page.label.clone();
@@ -2958,6 +2983,9 @@ impl BrowserManager {
     /// commands (`window new`, recording setup) where the new page should
     /// become active.
     pub fn add_page(&mut self, page: PageInfo) {
+        // Explicitly created by this session (`window new`, recording
+        // setup): popups opened from it belong here even when it is idle.
+        self.owned_targets.insert(page.target_id.clone());
         self.add_page_with_activation(page, true);
     }
 
@@ -3007,6 +3035,7 @@ impl BrowserManager {
     pub fn remove_page_by_target_id(&mut self, target_id: &str) {
         if let Some(pos) = self.pages.iter().position(|p| p.target_id == target_id) {
             let page = self.pages.remove(pos);
+            self.owned_targets.remove(&page.target_id);
             self.tab_keep.remove(target_id);
             self.update_active_page_after_removal(pos);
             // If the destroyed target was the bound tab (closed externally,
@@ -3020,13 +3049,53 @@ impl BrowserManager {
         self.pages.iter().any(|p| p.target_id == target_id)
     }
 
+    /// Whether `opener_id` names a tab this session owns: any tab it opened
+    /// itself (active, bound, or idle in the background), or a tab it
+    /// adopted as its active/bound tab when attaching to a shared browser.
+    /// Popup targets (`Target.targetCreated` with `openerId`) are adopted
+    /// only by the session that owns the opener; a session that merely
+    /// tracks the opener (every daemon sharing one browser sees every
+    /// tab) is not its owner.
+    pub fn owns_opener(&self, opener_id: &str) -> bool {
+        if opener_id.is_empty() {
+            return false;
+        }
+        if self.owned_targets.contains(opener_id) {
+            return true;
+        }
+        if self
+            .pages
+            .get(self.active_page_index)
+            .is_some_and(|p| p.target_id == opener_id)
+        {
+            return true;
+        }
+        self.bound_target_id.as_deref() == Some(opener_id)
+    }
+
+    /// Whether this session should adopt a newly discovered `target`.
+    /// Popups (targets with an `openerId`) belong to the session that owns
+    /// the opener target: other sessions ignore them so a popup opened by
+    /// one agent never appears in another agent's tab list. A popup whose
+    /// opener is unknown here (e.g. an internal page this session filters
+    /// out) keeps the legacy behavior. Targets without an opener are
+    /// unaffected.
+    pub fn should_adopt_discovered_target(&self, target: &TargetInfo) -> bool {
+        match target.opener_id.as_deref().filter(|s| !s.is_empty()) {
+            None => true,
+            Some(opener) => self.owns_opener(opener) || !self.has_target(opener),
+        }
+    }
+
     /// Single decision point for both CDP target drains
     /// (`Target.attachedToTarget` and `Target.targetCreated`). A tracked
     /// target only has its metadata refreshed; a new one is appended and
     /// activated per pin mode: a pinned session never lets a discovered tab
     /// steal the active tab or pin binding, a legacy session follows it.
-    /// Explicit commands (`tab new`, `window new`, `click --new-tab`) take
-    /// their own `add_page` path. Covered by `test_register_discovered_page_*`.
+    /// Popups opened by another session's tab are ignored (see
+    /// `should_adopt_discovered_target`). Explicit commands (`tab new`,
+    /// `window new`, `click --new-tab`) take their own `add_page` path.
+    /// Covered by `test_register_discovered_page_*`.
     pub fn register_discovered_page(
         &mut self,
         target_id: &str,
@@ -3034,12 +3103,20 @@ impl BrowserManager {
         url: String,
         title: String,
         target_type: String,
+        opener_id: Option<&str>,
     ) -> bool {
         if let Some(p) = self.pages.iter_mut().find(|p| p.target_id == target_id) {
             p.url = url;
             p.title = title;
             p.target_type = target_type;
             return false;
+        }
+        if let Some(opener) = opener_id.filter(|s| !s.is_empty()) {
+            if !self.owns_opener(opener) && self.has_target(opener) {
+                // Another session's popup: the opener is tracked here but
+                // owned elsewhere, so its owner's daemon adopts it.
+                return false;
+            }
         }
         let tab_id = self.assign_tab_id();
         // Pinned sessions never activate a discovered tab (strict no-steal);
@@ -3259,6 +3336,7 @@ async fn initialize_lightpanda_manager(
             direct_page: false,
             pin_tab: false,
             own_window: false,
+            owned_targets: HashSet::new(),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -3372,6 +3450,7 @@ async fn initialize_obscura_manager(
             direct_page: false,
             pin_tab: false,
             own_window: false,
+            owned_targets: HashSet::new(),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -3787,6 +3866,7 @@ mod tests {
             url: String::new(),
             attached: None,
             browser_context_id: None,
+            opener_id: None,
         };
 
         assert!(should_track_target(&target));
@@ -3801,6 +3881,7 @@ mod tests {
             url: "chrome://newtab/".to_string(),
             attached: None,
             browser_context_id: None,
+            opener_id: None,
         };
 
         assert!(!should_track_target(&target));
@@ -3824,6 +3905,7 @@ mod tests {
             url: "https://example.com/popup".to_string(),
             attached: None,
             browser_context_id: None,
+            opener_id: None,
         };
 
         assert!(update_page_target_info_in_pages(&mut pages, &target));
@@ -4325,6 +4407,7 @@ mod tests {
             direct_page: false,
             pin_tab: false,
             own_window: false,
+            owned_targets: HashSet::new(),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -4389,6 +4472,7 @@ mod tests {
             direct_page: false,
             pin_tab: false,
             own_window: false,
+            owned_targets: HashSet::new(),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -5043,6 +5127,7 @@ mod tests {
             "https://popup.example".to_string(),
             String::new(),
             "page".to_string(),
+            None,
         );
 
         assert!(newly_added, "an untracked target must be registered");
@@ -5069,6 +5154,7 @@ mod tests {
             "https://foreign.example".to_string(),
             String::new(),
             "page".to_string(),
+            None,
         );
 
         assert!(newly_added, "an untracked target must be registered");
@@ -5150,6 +5236,7 @@ mod tests {
             "https://foreign.example".to_string(),
             String::new(),
             "page".to_string(),
+            None,
         );
         assert!(
             newly_added,
@@ -5186,6 +5273,7 @@ mod tests {
             "https://mine.example/updated".to_string(),
             "Updated Title".to_string(),
             "page".to_string(),
+            None,
         );
 
         assert!(
@@ -5214,7 +5302,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Background windows (AB-1)
+    // Background windows (AB-1) and popup ownership (AB-2)
     // -------------------------------------------------------------------
 
     /// `background_mode` is off for a fresh session and turns on either by
@@ -5233,6 +5321,187 @@ mod tests {
         mgr.set_own_window(true);
         assert!(mgr.own_window());
         assert!(mgr.background_mode());
+    }
+
+    /// A popup whose opener is this session's active tab is adopted, with
+    /// the legacy activation behavior preserved for non-pinned sessions.
+    #[tokio::test]
+    async fn test_register_discovered_page_adopts_popup_owned_by_active_tab() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        assert_eq!(mgr.active_target_id().unwrap(), TARGET_A);
+
+        let popup = "EEEE0000BBBB1111CCCC2222DDDD3333";
+        let newly_added = mgr.register_discovered_page(
+            popup,
+            "session-popup",
+            "https://popup.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(TARGET_A),
+        );
+
+        assert!(newly_added, "the owner's session must adopt its popup");
+        assert!(
+            mgr.has_target(popup),
+            "the adopted popup must show in the owner's tab list"
+        );
+        assert_eq!(
+            mgr.active_target_id().unwrap(),
+            popup,
+            "legacy activation behavior for owned popups is unchanged"
+        );
+    }
+
+    /// A pinned session adopts a popup opened by its bound tab but, like
+    /// any discovered tab, does not let it steal the active tab.
+    #[tokio::test]
+    async fn test_register_discovered_page_pinned_owner_adopts_popup_inactive() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_pin_tab(true);
+        assert!(mgr.restore_target_binding(TARGET_A, "https://mine.example"));
+
+        let popup = "EEEE0000BBBB1111CCCC2222DDDD3333";
+        let newly_added = mgr.register_discovered_page(
+            popup,
+            "session-popup",
+            "https://popup.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(TARGET_A),
+        );
+
+        assert!(newly_added, "the owner's session must adopt its popup");
+        assert!(mgr.has_target(popup));
+        assert_eq!(
+            mgr.active_target_id().unwrap(),
+            TARGET_A,
+            "the popup must not steal the pinned session's active tab"
+        );
+        assert_eq!(
+            mgr.bound_target_id(),
+            Some(TARGET_A),
+            "the popup must not overwrite the pin binding"
+        );
+    }
+
+    /// A popup opened from the session's own background tab is adopted:
+    /// ownership covers every tab the session opened, not just the active
+    /// or bound one. Force-red: drop the `owned_targets` check and the
+    /// popup is ignored because its opener is idle.
+    #[tokio::test]
+    async fn test_register_discovered_page_adopts_popup_from_own_inactive_tab() {
+        let mut mgr = test_manager(vec![]).await;
+        // Same path as `tab new`: the session opens two tabs, leaving the
+        // first idle in the background.
+        mgr.add_page(page(1, TARGET_A, "https://mine.example"));
+        mgr.add_page(page(2, TARGET_B, "https://other.example"));
+        mgr.set_pin_tab(true);
+        assert_eq!(mgr.active_target_id().unwrap(), TARGET_B);
+
+        let popup = "EEEE0000BBBB1111CCCC2222DDDD3333";
+        let newly_added = mgr.register_discovered_page(
+            popup,
+            "session-popup",
+            "https://popup.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(TARGET_A),
+        );
+
+        assert!(
+            newly_added,
+            "a popup from the session's own background tab must be adopted"
+        );
+        assert!(mgr.has_target(popup));
+        assert_eq!(
+            mgr.active_target_id().unwrap(),
+            TARGET_B,
+            "the popup must not steal the pinned session's active tab"
+        );
+        assert_eq!(
+            mgr.bound_target_id(),
+            Some(TARGET_B),
+            "the popup must not overwrite the pin binding"
+        );
+    }
+
+    /// A popup whose opener is tracked here but owned by another session
+    /// (not opened here, and neither this session's active nor bound tab)
+    /// is ignored: its owner's daemon adopts it on its own drain.
+    #[tokio::test]
+    async fn test_register_discovered_page_ignores_foreign_popup() {
+        let mut mgr = test_manager(vec![
+            page(1, TARGET_A, "https://mine.example"),
+            page(2, TARGET_B, "https://other.example"),
+        ])
+        .await;
+        // TARGET_A is active; TARGET_B is tracked but owned elsewhere.
+        assert_eq!(mgr.active_target_id().unwrap(), TARGET_A);
+        assert!(mgr.has_target(TARGET_B));
+        assert!(!mgr.owns_opener(TARGET_B));
+
+        let popup = "EEEE0000BBBB1111CCCC2222DDDD3333";
+        let newly_added = mgr.register_discovered_page(
+            popup,
+            "session-popup",
+            "https://popup.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(TARGET_B),
+        );
+
+        assert!(
+            !newly_added,
+            "a popup owned by another session must be ignored"
+        );
+        assert!(
+            !mgr.has_target(popup),
+            "the foreign popup must not enter this session's tab list"
+        );
+        assert_eq!(mgr.page_count(), 2);
+    }
+
+    /// A popup whose opener is unknown here (e.g. an internal page this
+    /// session filters out) keeps the legacy behavior: adopt per pin mode.
+    #[tokio::test]
+    async fn test_register_discovered_page_adopts_popup_with_unknown_opener() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        assert!(!mgr.has_target("UNKNOWN-OPENER"));
+
+        let popup = "EEEE0000BBBB1111CCCC2222DDDD3333";
+        let newly_added = mgr.register_discovered_page(
+            popup,
+            "session-popup",
+            "https://popup.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some("UNKNOWN-OPENER"),
+        );
+
+        assert!(
+            newly_added,
+            "a popup with an unknown opener must keep the legacy behavior"
+        );
+        assert!(mgr.has_target(popup));
+    }
+
+    /// An empty opener id behaves like no opener: the target is adopted.
+    #[tokio::test]
+    async fn test_register_discovered_page_empty_opener_adopts() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_pin_tab(true);
+
+        let newly_added = mgr.register_discovered_page(
+            TARGET_B,
+            "session-b",
+            "https://other.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(""),
+        );
+
+        assert!(newly_added, "an empty opener id must not block adoption");
+        assert!(mgr.has_target(TARGET_B));
     }
 
     #[tokio::test]

@@ -119,6 +119,10 @@ pub struct TargetInfo {
     pub url: String,
     pub attached: Option<bool>,
     pub browser_context_id: Option<String>,
+    /// The opener target for popups (`window.open`, `target=_blank` links).
+    /// Absent for root targets and on older endpoints that omit it.
+    #[serde(default)]
+    pub opener_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -592,4 +596,45 @@ pub struct BrowserVersionInfo {
 #[allow(clippy::upper_case_acronyms)]
 pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/cdp_generated.rs"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Popups carry `openerId` in `Target.targetCreated`; the field must
+    /// deserialize so popup routing (AB-2) can attribute them to the
+    /// session that owns the opener.
+    #[test]
+    fn test_target_info_deserializes_opener_id() {
+        let event: TargetCreatedEvent = serde_json::from_value(serde_json::json!({
+            "targetInfo": {
+                "targetId": "POPUP",
+                "type": "page",
+                "title": "popup",
+                "url": "https://popup.example/",
+                "attached": true,
+                "openerId": "OPENER",
+            }
+        }))
+        .unwrap();
+        assert_eq!(event.target_info.opener_id.as_deref(), Some("OPENER"));
+    }
+
+    /// Endpoints that omit `openerId` (older Chrome, root targets) must
+    /// keep deserializing: the field defaults to `None`.
+    #[test]
+    fn test_target_info_opener_id_defaults_to_none() {
+        let event: TargetCreatedEvent = serde_json::from_value(serde_json::json!({
+            "targetInfo": {
+                "targetId": "ROOT",
+                "type": "page",
+                "title": "root",
+                "url": "https://root.example/",
+                "attached": true,
+            }
+        }))
+        .unwrap();
+        assert_eq!(event.target_info.opener_id, None);
+    }
 }
