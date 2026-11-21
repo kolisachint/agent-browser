@@ -3209,11 +3209,7 @@ impl BrowserManager {
         };
         let _ = self
             .client
-            .send_command(
-                "Browser.setDownloadBehavior",
-                Some(&params),
-                self.session_scope(),
-            )
+            .send_command("Browser.setDownloadBehavior", Some(params), None)
             .await;
     }
 

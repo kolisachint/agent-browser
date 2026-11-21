@@ -772,17 +772,7 @@ pub struct DaemonState {
     /// browser only claim their own downloads. Bounded; cleared when full.
     download_frames: HashMap<String, String>,
     pub webmcp: webmcp::RuntimeState,
-    /// Apply the session's download folder after attaching to a browser the
-/// daemon did not launch, so passive downloads report `Browser.download*`
-/// events with their path (AB-3). Local launches set this up themselves.
-async fn apply_session_download_behavior(state: &mut DaemonState) {
-    let path = state.settings.download_path();
-    if let Some(ref mut mgr) = state.browser {
-        mgr.apply_session_download_path(path).await;
-    }
-}
-
-/// Whether the active launch opted into Chrome's experimental WebMCP features.
+    /// Whether the active launch opted into Chrome's experimental WebMCP features.
     pub webmcp_enabled: bool,
     pub screencasting: bool,
     pub policy: Option<ActionPolicy>,
@@ -906,6 +896,16 @@ async fn apply_session_download_behavior(state: &mut DaemonState) {
     pub own_window: bool,
     /// Last binding written to disk, so persistence is write-on-change.
     last_persisted_binding: Option<tab_binding::TabBinding>,
+}
+
+/// Apply the session's download folder after attaching to a browser the
+/// daemon did not launch, so passive downloads report `Browser.download*`
+/// events with their path (AB-3). Local launches set this up themselves.
+async fn apply_session_download_behavior(state: &mut DaemonState) {
+    let path = state.settings.download_path();
+    if let Some(ref mut mgr) = state.browser {
+        mgr.apply_session_download_path(path).await;
+    }
 }
 
 fn default_idle_shutdown_is_blocked(
