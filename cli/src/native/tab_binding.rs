@@ -42,12 +42,21 @@ pub struct TabBinding {
     #[serde(default)]
     pub own_window: bool,
     /// CDP endpoint the session was attached to (`--cdp` value: a ws(s) URL,
-    /// http(s) URL, or port). Persisted so a session bound to a CDP endpoint
-    /// reattaches to that same endpoint after its daemon dies instead of
-    /// launching a private browser. `None` for locally launched browsers.
-    /// Cleared by an explicit `close`; never stores auth headers.
+    /// http(s) URL, or port). Only persisted when it carries no credentials,
+    /// query, or fragment. Cleared by an explicit `close`.
     #[serde(default)]
     pub cdp: Option<String>,
+    /// Tabs this session owns (bound tab, tabs it opened, adopted popups).
+    /// Restored after a daemon restart so popup ownership survives.
+    #[serde(default)]
+    pub owned_targets: Vec<String>,
+    /// Browser context created by `window new`, if any.
+    #[serde(default)]
+    pub browser_context_id: Option<String>,
+    /// Identity of the attached browser, to refuse a reattach that landed on
+    /// a different browser sharing the same port.
+    #[serde(default)]
+    pub browser_id: Option<String>,
 }
 
 /// Path of the binding file for a session: `{socket_dir}/{session}.target`.
@@ -230,6 +239,9 @@ mod tests {
                 pinned: true,
                 own_window: true,
                 cdp: None,
+            owned_targets: Vec::new(),
+            browser_context_id: None,
+            browser_id: None,
             };
             save("agent-1", &binding).unwrap();
             let loaded = load("agent-1").unwrap().unwrap();
@@ -252,6 +264,9 @@ mod tests {
                 pinned: true,
                 own_window: false,
                 cdp: None,
+            owned_targets: Vec::new(),
+            browser_context_id: None,
+            browser_id: None,
             };
 
             save("opaque", &binding).unwrap();
@@ -319,6 +334,9 @@ mod tests {
             pinned: true,
             own_window: false,
             cdp: None,
+            owned_targets: Vec::new(),
+            browser_context_id: None,
+            browser_id: None,
         };
         assert!(save("blocked", &binding).is_err());
     }
@@ -334,6 +352,9 @@ mod tests {
                 pinned: false,
                 own_window: false,
                 cdp: None,
+            owned_targets: Vec::new(),
+            browser_context_id: None,
+            browser_id: None,
             };
             save("perms", &binding).unwrap();
             let mode = fs::metadata(binding_path("perms"))
@@ -353,6 +374,9 @@ mod tests {
                 pinned: false,
                 own_window: false,
                 cdp: None,
+            owned_targets: Vec::new(),
+            browser_context_id: None,
+            browser_id: None,
             };
             save("tmpcheck", &binding).unwrap();
             let dir = binding_path("tmpcheck").parent().unwrap().to_path_buf();
@@ -374,6 +398,9 @@ mod tests {
                 pinned: false,
                 own_window: false,
                 cdp: None,
+            owned_targets: Vec::new(),
+            browser_context_id: None,
+            browser_id: None,
             };
             let b = TabBinding {
                 target_id: "BBBB".to_string(),
@@ -381,6 +408,9 @@ mod tests {
                 pinned: true,
                 own_window: true,
                 cdp: None,
+            owned_targets: Vec::new(),
+            browser_context_id: None,
+            browser_id: None,
             };
             save("session-a", &a).unwrap();
             save("session-b", &b).unwrap();
@@ -428,6 +458,9 @@ mod tests {
                 pinned,
                 own_window: false,
                 cdp: None,
+            owned_targets: Vec::new(),
+            browser_context_id: None,
+            browser_id: None,
             },
         )
         .unwrap();
@@ -512,6 +545,9 @@ mod tests {
                 pinned: true,
                 own_window: false,
                 cdp: Some("ws://127.0.0.1:9222/devtools/browser/x".to_string()),
+            owned_targets: Vec::new(),
+            browser_context_id: None,
+            browser_id: None,
             };
             save("cdp-round-trip", &binding).unwrap();
             assert_eq!(load("cdp-round-trip").unwrap(), Some(binding));

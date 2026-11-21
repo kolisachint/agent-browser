@@ -798,6 +798,9 @@ async fn test_daemon_state_new_reads_sticky_pinned_binding() {
             pinned: true,
             own_window: false,
             cdp: None,
+            owned_targets: Vec::new(),
+            browser_context_id: None,
+            browser_id: None,
         },
     )
     .unwrap();
@@ -840,6 +843,9 @@ async fn test_pin_tab_false_disables_persisted_pin_across_restart() {
             pinned: true,
             own_window: false,
             cdp: None,
+            owned_targets: Vec::new(),
+            browser_context_id: None,
+            browser_id: None,
         },
     )
     .unwrap();
@@ -902,6 +908,9 @@ fn pin_binding(pinned: bool) -> super::tab_binding::TabBinding {
         pinned,
         own_window: false,
         cdp: None,
+        owned_targets: Vec::new(),
+        browser_context_id: None,
+        browser_id: None,
     }
 }
 

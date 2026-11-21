@@ -1,6 +1,8 @@
 //! Downloads observed on the attached browser, so `wait --download` can
 //! claim a download that finished before the command arrived (#561).
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,28 +165,21 @@ impl DownloadLedger {
     }
 }
 
-/// Whether the download reported on `owner_session` belongs to the session
-/// bound to `bound_target`. The caller resolves the owner session from the
-/// record first: its `page_session`, or the daemon's frame-to-session index
-/// for the record's `frame_id` when only sessionless `Browser.*` events
-/// arrived. `session_target` resolves one of this daemon's CDP session ids
-/// to its target id; every daemon attaches to every tab of a shared browser,
-/// so a raw session match cannot tell tabs apart. A download with no
-/// attributable target (unknown frame, or an unbound session) is owned: that
-/// preserves the single-session behavior and lets a restarted daemon claim a
-/// download that began before it learned the frame.
+/// Whether the download owned by `owner_target` belongs to this session.
+/// Legacy sessions (`strict == false`) keep upstream behavior and claim
+/// anything. Strict sessions (pinned or own-window) take only downloads whose
+/// owner target is in their owned set; unresolvable owners are not theirs.
 pub fn download_is_owned(
-    owner_session: Option<&str>,
-    bound_target: Option<&str>,
-    session_target: impl Fn(&str) -> Option<String>,
+    owner_target: Option<&str>,
+    owned: &HashSet<String>,
+    strict: bool,
 ) -> bool {
-    let Some(bound) = bound_target else {
-        // Legacy sessions track every tab; only pinning draws the boundary.
+    if !strict {
         return true;
-    };
-    match owner_session.and_then(&session_target) {
-        Some(target) => target == bound,
-        None => true,
+    }
+    match owner_target {
+        Some(target) => owned.contains(target),
+        None => false,
     }
 }
 
@@ -390,17 +385,27 @@ mod tests {
     }
 
     #[test]
-    fn ownership_follows_the_bound_target() {
-        let resolve = |session: &str| match session {
-            "s1" => Some("target-a".to_string()),
-            "s2" => Some("target-b".to_string()),
-            _ => None,
-        };
-        assert!(download_is_owned(Some("s1"), Some("target-a"), resolve));
-        assert!(!download_is_owned(Some("s2"), Some("target-a"), resolve));
-        assert!(download_is_owned(Some("s9"), Some("target-a"), resolve));
-        assert!(download_is_owned(None, Some("target-a"), resolve));
-        assert!(download_is_owned(Some("s2"), None, resolve));
+    fn ownership_follows_the_owned_set() {
+        let owned: HashSet<String> = ["target-a".to_string()].into_iter().collect();
+        assert!(download_is_owned(Some("target-a"), &owned, true));
+        assert!(!download_is_owned(Some("target-b"), &owned, true));
+        assert!(!download_is_owned(Some("target-a"), &HashSet::new(), true));
+        assert!(!download_is_owned(None, &owned, true));
+    }
+
+    #[test]
+    fn legacy_sessions_claim_anything() {
+        let owned: HashSet<String> = ["target-a".to_string()].into_iter().collect();
+        assert!(download_is_owned(Some("target-b"), &owned, false));
+        assert!(download_is_owned(None, &owned, false));
+        assert!(download_is_owned(None, &HashSet::new(), false));
+    }
+
+    #[test]
+    fn popup_download_attributes_to_top_level_frame_target() {
+        let owned: HashSet<String> = ["target-a".to_string()].into_iter().collect();
+        assert!(download_is_owned(Some("target-a"), &owned, true));
+        assert!(!download_is_owned(Some("target-b"), &owned, true));
     }
 
     #[test]
