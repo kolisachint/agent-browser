@@ -4216,6 +4216,57 @@ async fn apply_tab_binding_on_attach(state: &mut DaemonState) -> Result<bool, St
         if let Some(context_id) = context_id {
             mgr.set_browser_context_id(Some(context_id));
         }
+        // A non-pinned `window new` context is created with the default
+        // disposeOnDetach, so Chrome disposes it when the daemon dies while
+        // the binding still carries its id. Trust the persisted context only
+        // while Chrome still knows it; otherwise a later `tab new` would
+        // build its target in a dead context and fail. An endpoint that does
+        // not report a list (old or proxied Chrome) keeps the binding.
+        if let Some(context_id) = mgr.browser_context_id().map(str::to_string) {
+            let contexts: Value = mgr
+                .client
+                .send_command_no_params("Target.getBrowserContexts", None)
+                .await
+                .unwrap_or(json!({}));
+            if let Some(ids) = contexts.get("browserContextIds").and_then(|v| v.as_array()) {
+                let live: Vec<&str> = ids.iter().filter_map(|v| v.as_str()).collect();
+                if !live.contains(&context_id.as_str()) {
+                    mgr.set_browser_context_id(None);
+                    mgr.set_own_window(false);
+                    state.own_window = false;
+                }
+            }
+        }
+        // Drop owned targets Chrome no longer knows (tabs in a disposed
+        // context, or closed elsewhere) so a restore never re-adopts a dead
+        // tab. Like the context check, an absent list keeps the binding.
+        if !mgr.owned_targets().is_empty() {
+            let live_targets: Option<HashSet<String>> = mgr
+                .client
+                .send_command_no_params("Target.getTargets", None)
+                .await
+                .ok()
+                .and_then(|result: Value| {
+                    result.get("targetInfos")?.as_array().map(|infos| {
+                        infos
+                            .iter()
+                            .filter_map(|t| {
+                                t.get("targetId")
+                                    .and_then(|id| id.as_str())
+                                    .map(str::to_string)
+                            })
+                            .collect()
+                    })
+                });
+            if let Some(live_targets) = live_targets {
+                let pruned: HashSet<String> = mgr
+                    .owned_targets()
+                    .intersection(&live_targets)
+                    .cloned()
+                    .collect();
+                mgr.set_owned_targets(pruned);
+            }
+        }
         // Refuse to continue in a different browser sharing the same port,
         // but only for a strict session (pinned or own-window) reattaching
         // through its persisted binding: an explicit --cdp/--auto-connect on
@@ -17924,6 +17975,115 @@ mod tests {
             Some("CTX-KEEP"),
             "context must survive a second attach in the same daemon"
         );
+    }
+
+    /// A non-pinned `window new` context is created with the default
+    /// disposeOnDetach, so Chrome disposes it when the daemon dies while the
+    /// binding still carries its id. The restore must forget the dead
+    /// context (and tabs that died with it) so a later `tab new` builds its
+    /// target without the dead context instead of failing against it.
+    #[tokio::test]
+    async fn reattach_forgets_a_browser_context_that_no_longer_exists() {
+        use super::super::tab_binding::{load, save, TabBinding};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/BROWSER-NEW",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let cmd: Value = serde_json::from_str(&text).unwrap();
+                let id = cmd["id"].clone();
+                let method = cmd["method"].as_str().unwrap_or("");
+                let reply = match method {
+                    "Target.getTargets" => serde_json::json!({ "id": id, "result": {
+                        "targetInfos": [
+                            { "targetId": "TABLIVE0123456789", "type": "page",
+                              "title": "live", "url": "https://example.com/",
+                              "attached": false },
+                        ] } }),
+                    "Target.getBrowserContexts" => serde_json::json!({ "id": id,
+                        "result": { "browserContextIds": ["CTX-OTHER"] } }),
+                    "Target.attachToTarget" => serde_json::json!({ "id": id,
+                        "result": { "sessionId": "S-LIVE" } }),
+                    // Chrome rejects a target created in a disposed context.
+                    "Target.createTarget" if cmd["params"]["browserContextId"] == "CTX-GONE" => {
+                        serde_json::json!({ "id": id, "error": { "code": -32000,
+                            "message": "No browser context with given id" } })
+                    }
+                    "Target.createTarget" => serde_json::json!({ "id": id, "result": {
+                        "targetId": "TABNEW0123456789" } }),
+                    _ => serde_json::json!({ "id": id, "result": {} }),
+                };
+                if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let (_env, mut state) = isolated_state();
+        state.session_id = "reattach-dead-context".to_string();
+        save(
+            &state.session_id,
+            &TabBinding {
+                target_id: "TABLIVE0123456789".to_string(),
+                url: "https://example.com/".to_string(),
+                pinned: false,
+                own_window: true,
+                cdp: Some("0".to_string()),
+                owned_targets: vec![
+                    "TABLIVE0123456789".to_string(),
+                    "TABDEAD0123456789".to_string(),
+                ],
+                browser_context_id: Some("CTX-GONE".to_string()),
+                browser_id: None,
+            },
+        )
+        .unwrap();
+        state.own_window = true;
+        let mgr = super::BrowserManager::connect_cdp(&url)
+            .await
+            .expect("connect");
+        state.browser = Some(mgr);
+        super::apply_tab_binding_on_attach(&mut state)
+            .await
+            .expect("restore with a dead context must not fail");
+        let mgr = state.browser.as_ref().unwrap();
+        assert_eq!(
+            mgr.browser_context_id(),
+            None,
+            "a context Chrome no longer knows must be forgotten"
+        );
+        assert!(
+            !mgr.own_window(),
+            "the own-window state dies with its context"
+        );
+        assert!(!state.own_window);
+        assert!(
+            mgr.owned_targets().contains("TABLIVE0123456789"),
+            "live owned tabs are kept"
+        );
+        assert!(
+            !mgr.owned_targets().contains("TABDEAD0123456789"),
+            "owned tabs Chrome no longer knows must be dropped"
+        );
+        // The point of forgetting: a later `tab new` builds its target
+        // without the dead context instead of failing against it.
+        let created = state
+            .browser
+            .as_mut()
+            .unwrap()
+            .tab_new(Some("https://example.com/"), None)
+            .await;
+        assert!(created.is_ok(), "tab new must work: {created:?}");
+        let binding = load(&state.session_id).unwrap().unwrap();
+        assert_eq!(binding.browser_context_id, None);
+        assert!(!binding.own_window);
     }
 
     #[tokio::test]
