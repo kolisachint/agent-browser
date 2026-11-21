@@ -4151,8 +4151,7 @@ async fn apply_tab_binding_on_attach(state: &mut DaemonState) -> Result<bool, St
         if state.own_window {
             mgr.set_own_window(true);
         }
-        let owned: std::collections::HashSet<String> =
-            state.owned_snapshot.drain(..).collect();
+        let owned: std::collections::HashSet<String> = state.owned_snapshot.drain(..).collect();
         if !owned.is_empty() {
             let mut merged = mgr.owned_targets().clone();
             merged.extend(owned);
@@ -9790,8 +9789,7 @@ async fn download_to_path(cmd: &Value, state: &mut DaemonState) -> Result<Value,
                     "Page.downloadProgress",
                 ) {
                     let guid = event.params.get("guid").and_then(|v| v.as_str());
-                    let page_match =
-                        downloaded_guid.as_deref().is_some_and(|g| Some(g) == guid);
+                    let page_match = downloaded_guid.as_deref().is_some_and(|g| Some(g) == guid);
                     let is_ours = page_match
                         || (!strict_download
                             && downloaded_guid.is_none()
@@ -13177,8 +13175,7 @@ fn claim_owned_download(state: &mut DaemonState) -> Option<DownloadRecord> {
                         .as_deref()
                         .and_then(|frame| frames.get(frame).map(String::as_str))
                 })?;
-                mgr.target_id_for_session(owner_session)
-                    .map(str::to_string)
+                mgr.target_id_for_session(owner_session).map(str::to_string)
             });
         download_is_owned(owner_target.as_deref(), &owned, strict)
     })
@@ -17226,6 +17223,145 @@ mod tests {
         );
     }
 
+    type RecordedEvents = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<Value>)>>>;
+
+    /// `window new` isolates the session's downloads in its own browser
+    /// context, and a pinned session's context survives the daemon.
+    #[tokio::test]
+    async fn window_new_uses_per_context_downloads() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let recorded: RecordedEvents = RecordedEvents::default();
+        let recorded_task = recorded.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let recorded_task = recorded_task.clone();
+                tokio::spawn(async move {
+                    let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                        Ok(ws) => ws,
+                        Err(_) => return,
+                    };
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let cmd: Value = serde_json::from_str(&text).unwrap();
+                        let method = cmd["method"].as_str().unwrap_or("").to_string();
+                        let params = cmd.get("params").cloned();
+                        recorded_task.lock().unwrap().push((method.clone(), params));
+                        let id = cmd["id"].clone();
+                        let result = match method.as_str() {
+                            "Target.createBrowserContext" => {
+                                serde_json::json!({ "browserContextId": "CTX-1" })
+                            }
+                            "Target.createTarget" => serde_json::json!({ "targetId": "T-NEW" }),
+                            "Target.attachToTarget" => serde_json::json!({ "sessionId": "S-NEW" }),
+                            _ => serde_json::json!({}),
+                        };
+                        let reply = serde_json::json!({ "id": id, "result": result });
+                        if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        for pinned in [true, false] {
+            recorded.lock().unwrap().clear();
+            let (_env, mut state) = isolated_state();
+            let client = crate::native::cdp::client::CdpClient::connect(&url)
+                .await
+                .unwrap();
+            state.browser = Some(super::BrowserManager::for_test(client, url.clone()));
+            state.pin_tab = pinned;
+            if let Some(ref mut mgr) = state.browser {
+                mgr.set_pin_tab(pinned);
+            }
+            state
+                .settings
+                .set(Key::DownloadPath, Value::from("/tmp/ab-downloads"));
+            super::handle_window_new(&serde_json::json!({}), &mut state)
+                .await
+                .expect("window new succeeds");
+            let mgr = state.browser.as_ref().unwrap();
+            assert!(mgr.own_window(), "window new records its own window");
+            assert_eq!(mgr.browser_context_id(), Some("CTX-1"));
+            let events = recorded.lock().unwrap().clone();
+            let context_params = events
+                .iter()
+                .find(|(m, _)| m == "Target.createBrowserContext")
+                .map(|(_, p)| p.clone());
+            if pinned {
+                assert_eq!(
+                    context_params,
+                    Some(Some(serde_json::json!({ "disposeOnDetach": false }))),
+                    "a pinned session's window survives the daemon",
+                );
+            } else {
+                assert!(
+                    matches!(context_params, Some(None)),
+                    "an unpinned session keeps the default context lifetime, {context_params:?}",
+                );
+            }
+            let download = events
+                .iter()
+                .find(|(m, _)| m == "Browser.setDownloadBehavior")
+                .and_then(|(_, p)| p.clone())
+                .expect("per-context download behavior is applied");
+            assert_eq!(download["browserContextId"], "CTX-1");
+            assert_eq!(download["downloadPath"], "/tmp/ab-downloads");
+            assert_eq!(download["behavior"], "allow");
+        }
+    }
+
+    /// Without a download folder the context still gets events, but never a
+    /// bare `allow` without a path.
+    #[tokio::test]
+    async fn own_context_without_path_keeps_default_behavior() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let recorded: RecordedEvents = RecordedEvents::default();
+        let recorded_task = recorded.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let cmd: Value = serde_json::from_str(&text).unwrap();
+                let method = cmd["method"].as_str().unwrap_or("").to_string();
+                let params = cmd.get("params").cloned();
+                recorded_task.lock().unwrap().push((method.clone(), params));
+                let id = cmd["id"].clone();
+                let reply = serde_json::json!({ "id": id, "result": {} });
+                if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let (_env, mut state) = isolated_state();
+        let client = crate::native::cdp::client::CdpClient::connect(&url)
+            .await
+            .unwrap();
+        let mut mgr = super::BrowserManager::for_test(client, url.clone());
+        mgr.set_browser_context_id(Some("CTX-9".to_string()));
+        state.browser = Some(mgr);
+        let mgr = state.browser.as_mut().unwrap();
+        mgr.apply_own_context_download_path(None).await;
+        let events = recorded.lock().unwrap().clone();
+        let download = events
+            .iter()
+            .find(|(m, _)| m == "Browser.setDownloadBehavior")
+            .and_then(|(_, p)| p.clone())
+            .expect("context download behavior is applied");
+        assert_eq!(download["behavior"], "default");
+        assert_eq!(download["browserContextId"], "CTX-9");
+        assert!(download.get("downloadPath").is_none());
+    }
+
     #[tokio::test]
     async fn close_forgets_the_persisted_endpoint() {
         use super::super::tab_binding::{load, save, TabBinding};
@@ -17237,13 +17373,15 @@ mod tests {
                 target_id: "ABCDEF0123456789".to_string(),
                 url: "https://example.com/".to_string(),
                 pinned: false,
+                own_window: true,
                 cdp: Some("9222".to_string()),
-                owned_targets: Vec::new(),
-                browser_context_id: None,
-                browser_id: None,
+                owned_targets: vec!["ABCDEF0123456789".to_string()],
+                browser_context_id: Some("CTX-1".to_string()),
+                browser_id: Some("browser-1".to_string()),
             },
         )
         .unwrap();
+        state.own_window = true;
         let result = super::execute_command(
             &serde_json::json!({ "action": "close", "id": "close-cdp" }),
             &mut state,
@@ -17252,7 +17390,12 @@ mod tests {
         assert_eq!(result["success"], true);
         let binding = load(&state.session_id).unwrap().unwrap();
         assert_eq!(binding.cdp, None);
+        assert!(!binding.own_window, "close resets the own-window state");
+        assert!(binding.owned_targets.is_empty());
+        assert_eq!(binding.browser_context_id, None);
+        assert_eq!(binding.browser_id, None);
         assert_eq!(binding.target_id, "ABCDEF0123456789");
+        assert!(!state.own_window);
     }
 
     #[test]

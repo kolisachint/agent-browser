@@ -239,9 +239,9 @@ mod tests {
                 pinned: true,
                 own_window: true,
                 cdp: None,
-            owned_targets: Vec::new(),
-            browser_context_id: None,
-            browser_id: None,
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
             };
             save("agent-1", &binding).unwrap();
             let loaded = load("agent-1").unwrap().unwrap();
@@ -264,9 +264,9 @@ mod tests {
                 pinned: true,
                 own_window: false,
                 cdp: None,
-            owned_targets: Vec::new(),
-            browser_context_id: None,
-            browser_id: None,
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
             };
 
             save("opaque", &binding).unwrap();
@@ -352,9 +352,9 @@ mod tests {
                 pinned: false,
                 own_window: false,
                 cdp: None,
-            owned_targets: Vec::new(),
-            browser_context_id: None,
-            browser_id: None,
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
             };
             save("perms", &binding).unwrap();
             let mode = fs::metadata(binding_path("perms"))
@@ -374,9 +374,9 @@ mod tests {
                 pinned: false,
                 own_window: false,
                 cdp: None,
-            owned_targets: Vec::new(),
-            browser_context_id: None,
-            browser_id: None,
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
             };
             save("tmpcheck", &binding).unwrap();
             let dir = binding_path("tmpcheck").parent().unwrap().to_path_buf();
@@ -398,9 +398,9 @@ mod tests {
                 pinned: false,
                 own_window: false,
                 cdp: None,
-            owned_targets: Vec::new(),
-            browser_context_id: None,
-            browser_id: None,
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
             };
             let b = TabBinding {
                 target_id: "BBBB".to_string(),
@@ -408,9 +408,9 @@ mod tests {
                 pinned: true,
                 own_window: true,
                 cdp: None,
-            owned_targets: Vec::new(),
-            browser_context_id: None,
-            browser_id: None,
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
             };
             save("session-a", &a).unwrap();
             save("session-b", &b).unwrap();
@@ -458,9 +458,9 @@ mod tests {
                 pinned,
                 own_window: false,
                 cdp: None,
-            owned_targets: Vec::new(),
-            browser_context_id: None,
-            browser_id: None,
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
             },
         )
         .unwrap();
@@ -545,9 +545,9 @@ mod tests {
                 pinned: true,
                 own_window: false,
                 cdp: Some("ws://127.0.0.1:9222/devtools/browser/x".to_string()),
-            owned_targets: Vec::new(),
-            browser_context_id: None,
-            browser_id: None,
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
             };
             save("cdp-round-trip", &binding).unwrap();
             assert_eq!(load("cdp-round-trip").unwrap(), Some(binding));

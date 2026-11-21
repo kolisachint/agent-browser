@@ -3319,7 +3319,10 @@ impl BrowserManager {
     /// Browser identity for reattach comparison (last segment of the
     /// `Browser.getVersion` debugger URL).
     pub fn browser_id_from_version_url(url: &str) -> Option<String> {
-        url.rsplit('/').next().filter(|s| !s.is_empty()).map(str::to_string)
+        url.rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
     }
 }
 
@@ -5713,6 +5716,20 @@ mod tests {
     /// A pinned session does not adopt a popup whose opener is unknown:
     /// grandchildren of a skipped foreign popup stay foreign instead of
     /// leaking in through the unknown-opener path.
+    /// An own-window session whose bound tab is gone reports tab-gone
+    /// instead of falling back to another session's tab.
+    #[tokio::test]
+    async fn test_restore_own_window_missing_tab_is_gone() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_own_window(true);
+        assert!(!mgr.restore_target_binding("MISSING-TARGET", "https://gone.example"));
+        assert!(
+            mgr.bound_target_is_gone(),
+            "an own-window session must not silently adopt another tab"
+        );
+        assert!(mgr.active_target_id().is_err());
+    }
+
     #[tokio::test]
     async fn test_register_discovered_page_pinned_unknown_opener_ignored() {
         let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;

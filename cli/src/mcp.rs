@@ -1106,7 +1106,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_CLOSE,
             "Close browser",
-            "Close the current browser session.",
+            "Close the current browser session. Closing also forgets its persisted CDP endpoint and own-window state, so the next session under this name starts fresh.",
             json!({
                 "all": { "type": "boolean", "default": false, "description": "Close all active sessions." }
             }),
@@ -1186,7 +1186,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_WAIT_FOR_DOWNLOAD,
             "Wait for download",
-            "Wait for a browser download. Each session keeps its own download folder on a shared browser and only reports its own downloads. A path is rejected over a remote --cdp endpoint, --auto-connect, or a provider.",
+            "Wait for a browser download. A session with its own browser context keeps its own download folder and only reports its own downloads. A path is rejected over a remote --cdp endpoint, --auto-connect, or a provider.",
             json!({ "path": { "type": "string", "description": "Optional output path." }, "waitTimeoutMs": wait_timeout_schema() }),
             &[],
         ),
@@ -1478,7 +1478,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_WINDOW_NEW,
             "Window new",
-            "Open a new browser window owned by the session; later tab switches stay in that window and never take focus.",
+            "Open a new browser window owned by the session in its own browser context. Only pinned sessions stay in the background; the rest keep upstream foreground behavior.",
             json!({}),
             &[],
         ),
