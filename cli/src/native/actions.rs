@@ -3791,8 +3791,12 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
                 None => Ok(()),
             };
             lifecycle_relaunched_browser |= settings_outcome.relaunched_browser;
+            // Box the launch future: at ~23KB it dominates this dispatch's
+            // state machine, and confirm replays nest this dispatcher twice.
+            // Keeping it on the heap keeps nested command chains comfortably
+            // inside the test-thread stack.
             let result = match applied {
-                Ok(()) => handle_launch(cmd, state).await,
+                Ok(()) => Box::pin(handle_launch(cmd, state)).await,
                 Err(e) => Err(e),
             };
             match result {
@@ -4372,9 +4376,18 @@ async fn apply_tab_binding_on_attach(state: &mut DaemonState) -> Result<bool, St
         None => {
             if pin {
                 // A pinned session never implicitly adopts an existing tab:
-                // start it on a fresh one.
+                // start it on a fresh one. The bootstrap tab only exists so
+                // the pin has something to bind until `window new` gives the
+                // session its own window; record it so the window can close
+                // the stray while it is still blank.
                 if let Some(ref mut mgr) = state.browser {
-                    mgr.tab_new(None, None).await?;
+                    let created = mgr.tab_new(None, None).await?;
+                    mgr.set_pinned_bootstrap_target(
+                        created
+                            .get("targetId")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                    );
                 }
                 true
             } else {
@@ -13423,6 +13436,20 @@ fn move_download(saved: &std::path::Path, path_str: &str) -> Result<Value, Strin
     Ok(json!({ "path": dest.to_string_lossy() }))
 }
 
+/// Close the pinned bootstrap tab recorded by `apply_tab_binding_on_attach`
+/// once the session owns a window, but only while it is still a blank
+/// placeholder: a tab the user has since navigated keeps working untouched.
+async fn close_bootstrap_tab_if_still_blank(mgr: &mut BrowserManager, bootstrap: String) {
+    let bootstrap_tab_id = mgr
+        .pages_list()
+        .into_iter()
+        .find(|p| p.target_id == bootstrap && p.url == "about:blank")
+        .map(|p| p.tab_id);
+    if let Some(bootstrap_tab_id) = bootstrap_tab_id {
+        let _ = mgr.tab_close_by_id(Some(bootstrap_tab_id), None).await;
+    }
+}
+
 async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let pinned = state.pin_tab;
     let download_path = state.settings.download_path();
@@ -13483,6 +13510,14 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
             title: String::new(),
             target_type: "page".to_string(),
         });
+        // A pinned attach with no binding opened a bootstrap tab first; the
+        // session now owns a window, so close the stray while it is still a
+        // blank placeholder instead of leaking it into the tab list. Boxed
+        // so the close future stays on the heap instead of growing every
+        // `execute_command` poll frame that contains this handler.
+        if let Some(bootstrap) = mgr.take_pinned_bootstrap_target() {
+            Box::pin(close_bootstrap_tab_if_still_blank(mgr, bootstrap)).await;
+        }
         // The fresh context gets its own window, recorded on the session.
         // Only pinned sessions run in the background; the rest keep
         // upstream foreground behavior.
@@ -17640,6 +17675,122 @@ mod tests {
             assert_eq!(download["downloadPath"], "/tmp/ab-downloads");
             assert_eq!(download["behavior"], "allow");
         }
+    }
+
+    /// A pinned attach with no binding opens a bootstrap tab first; `window
+    /// new` must close that stray once the session owns a window, leaving a
+    /// single page behind. The mock answers the bootstrap `createTarget`
+    /// (no browser context) with T-BOOT and the window's `createTarget`
+    /// with T-NEW. Force-red: without the bootstrap cleanup the bootstrap
+    /// survives and the session ends up with two pages.
+    #[tokio::test]
+    async fn pinned_attach_bootstrap_tab_is_closed_by_window_new() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let recorded: RecordedEvents = RecordedEvents::default();
+        let recorded_task = recorded.clone();
+        let closed: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let closed_task = closed.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let recorded_task = recorded_task.clone();
+                let closed_task = closed_task.clone();
+                tokio::spawn(async move {
+                    let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                        Ok(ws) => ws,
+                        Err(_) => return,
+                    };
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let cmd: Value = serde_json::from_str(&text).unwrap();
+                        let method = cmd["method"].as_str().unwrap_or("").to_string();
+                        let params = cmd.get("params").cloned();
+                        recorded_task
+                            .lock()
+                            .unwrap()
+                            .push((method.clone(), params.clone()));
+                        let id = cmd["id"].clone();
+                        let result = match method.as_str() {
+                            "Target.createBrowserContext" => {
+                                serde_json::json!({ "browserContextId": "CTX-W" })
+                            }
+                            "Target.createTarget" => {
+                                let with_context = params
+                                    .as_ref()
+                                    .is_some_and(|p| p.get("browserContextId").is_some());
+                                if with_context {
+                                    serde_json::json!({ "targetId": "T-NEW" })
+                                } else {
+                                    serde_json::json!({ "targetId": "T-BOOT" })
+                                }
+                            }
+                            "Target.attachToTarget" => {
+                                let target = params
+                                    .as_ref()
+                                    .and_then(|p| p.get("targetId"))
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("T-?");
+                                serde_json::json!({ "sessionId": format!("S-{target}") })
+                            }
+                            "Target.closeTarget" => {
+                                if let Some(target) = params
+                                    .as_ref()
+                                    .and_then(|p| p.get("targetId"))
+                                    .and_then(|t| t.as_str())
+                                {
+                                    closed_task.lock().unwrap().push(target.to_string());
+                                }
+                                serde_json::json!({})
+                            }
+                            _ => serde_json::json!({}),
+                        };
+                        let reply = serde_json::json!({ "id": id, "result": result });
+                        if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let (_env, mut state) = isolated_state();
+        state.pin_tab = true;
+        let client = CdpClient::connect(&url).await.unwrap();
+        state.browser = Some(BrowserManager::for_test(client, url.clone()));
+
+        assert!(
+            super::apply_tab_binding_on_attach(&mut state)
+                .await
+                .expect("pinned attach opens a bootstrap tab"),
+            "pinned attach with no binding must establish a selection"
+        );
+        {
+            let mgr = state.browser.as_ref().unwrap();
+            assert_eq!(mgr.page_count(), 1);
+            assert_eq!(mgr.active_target_id().unwrap(), "T-BOOT");
+        }
+
+        let result = super::handle_window_new(&serde_json::json!({}), &mut state)
+            .await
+            .expect("window new succeeds");
+        assert_eq!(
+            result.get("tabId").and_then(|v| v.as_str()),
+            Some("t2"),
+            "the window opens a second tab, got {result:?}"
+        );
+        assert_eq!(result.get("total").and_then(|v| v.as_u64()), Some(1));
+
+        let mgr = state.browser.as_ref().unwrap();
+        assert_eq!(mgr.page_count(), 1, "the bootstrap stray must be closed");
+        assert_eq!(mgr.active_target_id().unwrap(), "T-NEW");
+        assert_eq!(
+            closed.lock().unwrap().as_slice(),
+            ["T-BOOT"],
+            "only the bootstrap tab is closed"
+        );
     }
 
     /// Without a download folder the context still gets events, but never a

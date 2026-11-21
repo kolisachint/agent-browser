@@ -766,6 +766,11 @@ pub struct BrowserManager {
     /// restored binding, adopted popups, transitively). Popup ownership is
     /// decided by this set.
     owned_targets: HashSet<String>,
+    /// Bootstrap tab a pinned attach with no binding opened (`tab new` on
+    /// an empty pin) so the pin has something to bind. `window new` closes
+    /// it while it is still a blank placeholder, once the session owns a
+    /// window, instead of leaking the stray into the tab list.
+    pinned_bootstrap_target: Option<String>,
     /// Sessions being prepared before their page is registered that must
     /// not get focus emulation: drained foreign tabs on a pinned session.
     /// `prepare_domains` runs before `register_discovered_page` in the
@@ -1011,6 +1016,7 @@ impl BrowserManager {
                 browser_context_id: None,
                 browser_id: None,
                 owned_targets: HashSet::new(),
+                pinned_bootstrap_target: None,
                 foreign_pending_sessions: HashSet::new(),
                 skipped_targets: Box::new(HashSet::new()),
                 recently_removed_owned: Box::new(VecDeque::new()),
@@ -1129,6 +1135,7 @@ impl BrowserManager {
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
+            pinned_bootstrap_target: None,
             foreign_pending_sessions: HashSet::new(),
             skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
@@ -1683,6 +1690,16 @@ impl BrowserManager {
 
     pub fn pin_tab(&self) -> bool {
         self.pin_tab
+    }
+
+    /// Record the bootstrap tab a pinned attach with no binding opened;
+    /// `window new` takes and closes it once the session owns a window.
+    pub fn set_pinned_bootstrap_target(&mut self, target_id: Option<String>) {
+        self.pinned_bootstrap_target = target_id;
+    }
+
+    pub fn take_pinned_bootstrap_target(&mut self) -> Option<String> {
+        self.pinned_bootstrap_target.take()
     }
 
     pub fn set_own_window(&mut self, own: bool) {
@@ -2249,6 +2266,7 @@ impl BrowserManager {
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
+            pinned_bootstrap_target: None,
             foreign_pending_sessions: HashSet::new(),
             skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
@@ -3360,6 +3378,12 @@ impl BrowserManager {
         // those, so owning them here would break popup isolation.
         if is_popup {
             self.owned_targets.insert(target_id.to_string());
+        } else if self.own_window && !self.pin_tab {
+            // An own-window session without pin follows a discovered root
+            // tab (upstream behavior), but must not own it: only tabs it
+            // opened or popups it adopted count as owned, so another
+            // session's tab never becomes this session's tab.
+            self.owned_targets.remove(target_id);
         }
         true
     }
@@ -3618,6 +3642,7 @@ async fn initialize_lightpanda_manager(
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
+            pinned_bootstrap_target: None,
             foreign_pending_sessions: HashSet::new(),
             skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
@@ -3737,6 +3762,7 @@ async fn initialize_obscura_manager(
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
+            pinned_bootstrap_target: None,
             foreign_pending_sessions: HashSet::new(),
             skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
@@ -5040,6 +5066,7 @@ mod tests {
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
+            pinned_bootstrap_target: None,
             foreign_pending_sessions: HashSet::new(),
             skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
@@ -5110,6 +5137,7 @@ mod tests {
             browser_context_id: None,
             browser_id: None,
             owned_targets: HashSet::new(),
+            pinned_bootstrap_target: None,
             foreign_pending_sessions: HashSet::new(),
             skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
@@ -6342,6 +6370,70 @@ mod tests {
             "an own-window session must not follow another session's tab"
         );
         assert_eq!(mgr.bound_target_id(), Some(TARGET_A));
+    }
+
+    /// An own-window session without pin follows a discovered root tab
+    /// (upstream behavior) but must not own it: only tabs it opened or
+    /// popups it adopted count as owned, so another session's tab never
+    /// becomes this session's tab. Force-red: keep the ownership insert
+    /// and the followed tab leaks into `owned_targets`.
+    #[tokio::test]
+    async fn test_register_discovered_page_own_window_follows_but_does_not_own() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_own_window(true);
+        mgr.set_owned_targets([TARGET_A.to_string()].into_iter().collect());
+
+        let newly_added = mgr.register_discovered_page(
+            TARGET_B,
+            "session-b",
+            "https://other.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            None,
+        );
+
+        assert!(newly_added, "the tab is still followed");
+        assert!(mgr.has_target(TARGET_B));
+        assert_eq!(
+            mgr.active_target_id().unwrap(),
+            TARGET_B,
+            "an own-window session without pin still follows the tab"
+        );
+        assert!(
+            !mgr.owned_targets().contains(TARGET_B),
+            "a followed root tab must not become an owned tab"
+        );
+        assert!(
+            mgr.owned_targets().contains(TARGET_A),
+            "tabs the session already owned stay owned"
+        );
+    }
+
+    /// An own-window session without pin still owns a popup it adopted:
+    /// only followed root tabs stay unowned. Force-red: skip the popup
+    /// ownership insert and adopted popups stop counting as owned.
+    #[tokio::test]
+    async fn test_register_discovered_page_own_window_adopts_popup_as_owned() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_own_window(true);
+        mgr.set_owned_targets([TARGET_A.to_string()].into_iter().collect());
+
+        let popup = "EEEE0000BBBB1111CCCC2222DDDD3333";
+        let newly_added = mgr.register_discovered_page(
+            popup,
+            "session-popup",
+            "https://popup.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(TARGET_A),
+        );
+
+        assert!(newly_added, "the adopted popup is tracked");
+        assert!(mgr.has_target(popup));
+        assert!(
+            mgr.owned_targets().contains(popup),
+            "a popup the session adopted must count as owned"
+        );
     }
 
     /// An empty opener id behaves like no opener: the target is adopted.
