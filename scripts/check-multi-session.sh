@@ -307,13 +307,13 @@ if [ -n "$LINK" ]; then
       if ab "s$i" tab list 2>/dev/null | grep -qE "popup.html|grandchild.html"; then ABSENT=0; fi
     done
     check "popup and grandchild absent from s2..s8" "$ABSENT"
-    python3 "$TMP/window_map.py" "$PORT" "$TMP/windows-popup.json" "$POPUP_TARGET" $TARGETS
-    python3 - "$TMP/windows-popup.json" <<'EOF'
+    S1_TARGET="$(echo "$TARGETS" | awk '{print $1}')"
+    python3 "$TMP/window_map.py" "$PORT" "$TMP/windows-popup.json" "$POPUP_TARGET" "$S1_TARGET"
+    python3 - "$TMP/windows-popup.json" "$POPUP_TARGET" "$S1_TARGET" <<'EOF'
 import json, sys
 m = json.load(open(sys.argv[1]))
-tids = list(m)
-owner_window = m[tids[1]]["windowId"]
-assert m[tids[0]]["windowId"] == owner_window, "popup left the owner window"
+owner_window = m[sys.argv[3]]["windowId"]
+assert m[sys.argv[2]]["windowId"] == owner_window, "popup left the owner window"
 EOF
     [ "$?" = 0 ] && check "popup lives in the owner window" 1 || check "popup lives in the owner window" 0
   fi
