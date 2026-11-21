@@ -7234,6 +7234,23 @@ async fn close_session(state: &mut DaemonState, forget_settings: bool) -> Result
         Some(mgr) => mgr.thaw_frozen_tabs().await.err(),
         None => None,
     };
+    // A session that owns a browser context (`window new`) must dispose it
+    // on close: a pinned session's context was created with
+    // disposeOnDetach:false, so it would otherwise survive the close as an
+    // orphaned window in the shared Chromium. Best effort: a context that
+    // is already gone reports "not found", which is the desired end state.
+    if let Some(mgr) = state.browser.as_ref() {
+        if let Some(context_id) = mgr.browser_context_id().map(str::to_string) {
+            let _ = mgr
+                .client
+                .send_command(
+                    "Target.disposeBrowserContext",
+                    Some(json!({ "browserContextId": context_id })),
+                    None,
+                )
+                .await;
+        }
+    }
     close_all_browser_backends(state).await?;
     state.attached_target = None;
     // An explicit close ends the session: forget the CDP endpoint, the own
@@ -17943,6 +17960,105 @@ mod tests {
         assert_eq!(binding.browser_id, None);
         assert_eq!(binding.target_id, "ABCDEF0123456789");
         assert!(!state.own_window);
+    }
+
+    /// Closing a session that owns a browser context disposes the context
+    /// first, so a pinned `window new` session does not leave an orphaned
+    /// window behind in the shared Chromium.
+    #[tokio::test]
+    async fn close_disposes_the_sessions_own_browser_context() {
+        use super::super::tab_binding::{load, save, TabBinding};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let recorded: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_task = recorded.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/mock",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let (mut tx, mut rx) = ws.split();
+            while let Some(Ok(msg)) = rx.next().await {
+                let Message::Text(text) = msg else {
+                    continue;
+                };
+                let cmd: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(id) = cmd["id"].as_u64() else {
+                    continue;
+                };
+                let method = cmd["method"].as_str().unwrap_or("").to_string();
+                recorded_task
+                    .lock()
+                    .unwrap()
+                    .push((method.clone(), cmd["params"].clone()));
+                let reply = match method.as_str() {
+                    "Target.getTargets" => json!({ "id": id, "result": {
+                        "targetInfos": [
+                            { "targetId": "ABCDEF0123456789", "type": "page",
+                              "title": "t", "url": "https://example.com/",
+                              "attached": false },
+                        ] } }),
+                    "Target.attachToTarget" => {
+                        json!({ "id": id, "result": { "sessionId": "S-1" } })
+                    }
+                    _ => json!({ "id": id, "result": {} }),
+                };
+                let _ = tx.send(Message::Text(reply.to_string())).await;
+            }
+        });
+
+        let (env, mut state) = isolated_state();
+        let mut mgr = super::BrowserManager::connect_cdp(&mock_url)
+            .await
+            .expect("connect");
+        mgr.set_browser_context_id(Some("CTX-DISPOSE".to_string()));
+        mgr.set_own_window(true);
+        state.browser = Some(mgr);
+        state.own_window = true;
+        save(
+            &state.session_id,
+            &TabBinding {
+                target_id: "ABCDEF0123456789".to_string(),
+                url: "https://example.com/".to_string(),
+                pinned: false,
+                own_window: true,
+                cdp: Some("9222".to_string()),
+                owned_targets: vec!["ABCDEF0123456789".to_string()],
+                browser_context_id: Some("CTX-DISPOSE".to_string()),
+                browser_id: Some("browser-1".to_string()),
+            },
+        )
+        .unwrap();
+        let result = super::execute_command(
+            &serde_json::json!({ "action": "close", "id": "close-dispose" }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(result["success"], true, "{result}");
+        let dispose = recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(m, _)| m == "Target.disposeBrowserContext")
+            .cloned();
+        let (_, params) = dispose.expect("close must dispose the session's own browser context");
+        assert_eq!(params["browserContextId"], "CTX-DISPOSE");
+        let binding = load(&state.session_id).unwrap().unwrap();
+        assert_eq!(binding.browser_context_id, None);
+        assert!(!binding.own_window);
+        drop(env);
     }
 
     #[test]
