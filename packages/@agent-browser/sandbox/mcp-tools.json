@@ -477,7 +477,7 @@
         "openWorldHint": true,
         "readOnlyHint": false
       },
-      "description": "Close the current browser session.",
+      "description": "Close the current browser session. Closing also forgets its persisted CDP endpoint and own-window state, so the next session under this name starts fresh.",
       "inputSchema": {
         "properties": {
           "all": {
@@ -4672,7 +4672,7 @@
         "openWorldHint": true,
         "readOnlyHint": true
       },
-      "description": "Wait for a browser download. Each session keeps its own download folder on a shared browser and only reports its own downloads. A path is rejected over a remote --cdp endpoint, --auto-connect, or a provider.",
+      "description": "Wait for a browser download. A session with its own browser context keeps its own download folder and only reports its own downloads. A path is rejected over a remote --cdp endpoint, --auto-connect, or a provider.",
       "inputSchema": {
         "properties": {
           "path": {
@@ -5070,7 +5070,7 @@
         "openWorldHint": true,
         "readOnlyHint": false
       },
-      "description": "Open a new browser window owned by the session; later tab switches stay in that window and never take focus.",
+      "description": "Open a new browser window owned by the session in its own browser context. Only pinned sessions stay in the background; the rest keep upstream foreground behavior.",
       "inputSchema": {
         "properties": {
           "session": {

@@ -2835,7 +2835,7 @@ Modes:
   --fn <expression>    Wait for JavaScript expression to be truthy
   --text <text>        Wait for text to appear on page (substring match)
   --download [path]    Wait for a download to complete (optionally save to path).
-                       Each session keeps its own download folder on a shared browser
+                       A session with its own window keeps its own download folder
 
 Selector Wait Options:
   --state <state>      visible, hidden, attached, or detached
@@ -3039,7 +3039,8 @@ agent-browser close - Close the browser
 Usage: agent-browser close [options]
 
 Closes the browser instance for the current session. Closing also forgets a
-persisted CDP endpoint, so the next session under this name starts fresh.
+persisted CDP endpoint and the session's own-window state, so the next session
+under this name starts fresh.
 
 Aliases: quit, exit
 
@@ -3489,9 +3490,8 @@ agent-browser window - Manage browser windows
 Usage: agent-browser window <operation>
 
 Manage browser windows. A window opened with `window new` belongs to the
-session: later tab switches stay inside it and never take focus from other
-sessions, while focus emulation keeps input and screenshots working in the
-background window.
+session in its own browser context; only pinned sessions stay in the
+background while the rest keep upstream foreground behavior.
 
 Operations:
   new                  Open new browser window
@@ -4965,7 +4965,8 @@ Options:
   --cdp <port|url>           Connect via CDP; root WebSocket query slash is optional
                              The endpoint persists with the session: after its daemon dies
                              the next command reattaches to it instead of launching
-                             a private browser
+                             a private browser. Endpoints carrying credentials, a query
+                             or a fragment are never persisted
   --cdp-headers <json>       Headers for --cdp discovery and handshake, e.g. Authorization
                              (or AGENT_BROWSER_CDP_HEADERS env)
   --pin-tab                  Pin the session to its bound tab (or AGENT_BROWSER_PIN_TAB env)
