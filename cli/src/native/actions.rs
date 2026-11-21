@@ -13,7 +13,7 @@ use tokio::sync::{broadcast, oneshot, RwLock};
 use crate::connection::{get_socket_dir, INTERNAL_DAEMON_SHUTDOWN_ACTION};
 use crate::session_files::SessionFile;
 use crate::session_settings::{
-    named, spec, Connection, Effect, Key, Patch, Persist, Requested, Running, Store,
+    named, redact_url, spec, Connection, Effect, Key, Patch, Persist, Requested, Running, Store,
 };
 use crate::validation::{is_valid_session_name, session_name_error};
 
@@ -519,18 +519,7 @@ fn attached_target_from_endpoint(endpoint: &str) -> AttachedTarget {
 /// userinfo, query, or fragment, mirroring `redact_url` (whose output equals
 /// its input exactly then). Unsafe endpoints are never persisted.
 fn cdp_endpoint_is_safe_to_persist(endpoint: &str) -> bool {
-    let trimmed = endpoint.trim();
-    if trimmed.parse::<u16>().is_ok() {
-        return true;
-    }
-    let Some(rest) = trimmed.split_once("://").map(|(_, rest)| rest) else {
-        return true;
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    if authority.contains('@') {
-        return false;
-    }
-    !rest.contains(['?', '#'])
+    redact_url(endpoint) == endpoint
 }
 
 fn validate_ca_cert_launch_mode(

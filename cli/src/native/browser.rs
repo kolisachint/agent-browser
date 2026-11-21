@@ -786,12 +786,6 @@ pub struct BrowserManager {
     /// runs at the stack edge in unoptimized builds).
     #[allow(clippy::box_collection)]
     recently_removed_owned: Box<VecDeque<String>>,
-    /// Discovered targets skipped as foreign (popup of another session, or a
-    /// descendant of one). Bounded; keeps grandchildren of foreign popups
-    /// foreign after the parent was never tracked. Boxed like
-    /// `recently_removed_owned` to keep the manager small.
-    #[allow(clippy::box_collection)]
-    skipped_targets: Box<HashSet<String>>,
     /// CDP target id of the tab this session is bound to. Updated whenever
     /// the session creates a tab or explicitly switches tabs; persisted by
     /// the daemon so re-attach selects the same tab instead of index 0.
@@ -1018,7 +1012,6 @@ impl BrowserManager {
                 owned_targets: HashSet::new(),
                 pinned_bootstrap_target: None,
                 foreign_pending_sessions: HashSet::new(),
-                skipped_targets: Box::new(HashSet::new()),
                 recently_removed_owned: Box::new(VecDeque::new()),
                 bound_target_id: None,
                 bound_target_gone: None,
@@ -1137,7 +1130,6 @@ impl BrowserManager {
             owned_targets: HashSet::new(),
             pinned_bootstrap_target: None,
             foreign_pending_sessions: HashSet::new(),
-            skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
@@ -1834,16 +1826,6 @@ impl BrowserManager {
         self.foreign_pending_sessions.insert(session_id.to_string());
     }
 
-    fn remember_skipped(&mut self, target_id: &str) {
-        const MAX_SKIPPED: usize = 512;
-        if self.skipped_targets.len() >= MAX_SKIPPED {
-            if let Some(first) = self.skipped_targets.iter().next().cloned() {
-                self.skipped_targets.remove(&first);
-            }
-        }
-        self.skipped_targets.insert(target_id.to_string());
-    }
-
     /// Remember a just-closed owned target so a download whose owner was
     /// resolved while the tab was alive still counts as owned after the
     /// tab closes (a `target=_blank` download popup closes itself).
@@ -2268,7 +2250,6 @@ impl BrowserManager {
             owned_targets: HashSet::new(),
             pinned_bootstrap_target: None,
             foreign_pending_sessions: HashSet::new(),
-            skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
@@ -3350,7 +3331,6 @@ impl BrowserManager {
         }
         if let Some(opener) = opener_id.filter(|s| !s.is_empty()) {
             if self.pin_tab && !self.owns_opener(opener) {
-                self.remember_skipped(target_id);
                 return false;
             }
         }
@@ -3644,7 +3624,6 @@ async fn initialize_lightpanda_manager(
             owned_targets: HashSet::new(),
             pinned_bootstrap_target: None,
             foreign_pending_sessions: HashSet::new(),
-            skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
@@ -3764,7 +3743,6 @@ async fn initialize_obscura_manager(
             owned_targets: HashSet::new(),
             pinned_bootstrap_target: None,
             foreign_pending_sessions: HashSet::new(),
-            skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
@@ -5068,7 +5046,6 @@ mod tests {
             owned_targets: HashSet::new(),
             pinned_bootstrap_target: None,
             foreign_pending_sessions: HashSet::new(),
-            skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
@@ -5139,7 +5116,6 @@ mod tests {
             owned_targets: HashSet::new(),
             pinned_bootstrap_target: None,
             foreign_pending_sessions: HashSet::new(),
-            skipped_targets: Box::new(HashSet::new()),
             recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,

@@ -128,7 +128,7 @@ pub(super) fn redacted(key: Key, value: &Value) -> Value {
 
 /// A URL without userinfo and with its query and fragment hidden, since both
 /// commonly carry tokens. A bare port or anything that is not a URL is kept.
-pub(crate) fn redact_url(raw: &str) -> String {
+pub fn redact_url(raw: &str) -> String {
     let Some(scheme_end) = raw.find("://") else {
         return raw.to_string();
     };
