@@ -4152,7 +4152,14 @@ async fn apply_tab_binding_on_attach(state: &mut DaemonState) -> Result<bool, St
             mgr.set_own_window(true);
         }
         let owned: std::collections::HashSet<String> = state.owned_snapshot.drain(..).collect();
-        if !owned.is_empty() {
+        if pin {
+            // Discovery ran before the pin was known, so the bootstrap bound
+            // the first listed target (usually another session's tab on a
+            // shared browser). A pinned session owns only what its binding
+            // carries; `restore_target_binding` / `tab_new` below re-bind
+            // from there. Drop the bootstrap capture instead of merging it.
+            mgr.set_owned_targets(owned);
+        } else if !owned.is_empty() {
             let mut merged = mgr.owned_targets().clone();
             merged.extend(owned);
             mgr.set_owned_targets(merged);

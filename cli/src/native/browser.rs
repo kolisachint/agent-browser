@@ -2298,6 +2298,10 @@ impl BrowserManager {
         self.pages
             .iter()
             .enumerate()
+            // A pinned session shares its browser with other sessions: its
+            // tab list covers only the tabs it owns (bound tab, tabs it
+            // opened, popups it adopted), never the whole browser.
+            .filter(|(_, p)| !self.pin_tab || self.owned_targets.contains(&p.target_id))
             .map(|(i, p)| {
                 json!({
                     "tabId": format_tab_id(p.tab_id),
@@ -2487,6 +2491,23 @@ impl BrowserManager {
     /// Resolve a user-supplied `TabRef` (either `t<N>` or a label) to the
     /// stable numeric `tab_id`. Returns a teaching error for unknown tabs.
     pub fn resolve_tab_ref(&self, tab_ref: &TabRef) -> Result<u32, String> {
+        let tab_id = self.resolve_tab_ref_unscoped(tab_ref)?;
+        if self.pin_tab {
+            let owned = self
+                .pages
+                .iter()
+                .find(|p| p.tab_id == tab_id)
+                .is_some_and(|p| self.owned_targets.contains(&p.target_id));
+            if !owned {
+                return Err(format!(
+                    "Tab {tab_ref:?} is not owned by this pinned session; run `tab list` to see its own tabs",
+                ));
+            }
+        }
+        Ok(tab_id)
+    }
+
+    fn resolve_tab_ref_unscoped(&self, tab_ref: &TabRef) -> Result<u32, String> {
         match tab_ref {
             TabRef::Id(id) => {
                 if self.has_tab_id(*id) {
@@ -2639,6 +2660,15 @@ impl BrowserManager {
                 "Tab index {} out of range (0-{})",
                 index,
                 self.pages.len().saturating_sub(1)
+            ));
+        }
+        // A pinned session switches only within its own tabs; a foreign tab
+        // joins the owned set by adoption (a popup of an owned opener) or
+        // explicit creation, never by switching to it.
+        if self.pin_tab && !self.owned_targets.contains(&self.pages[index].target_id) {
+            return Err(format!(
+                "Tab {} is not owned by this pinned session; run `tab list` to see its own tabs",
+                format_tab_id(index as u32)
             ));
         }
 
@@ -3110,8 +3140,13 @@ impl BrowserManager {
         self.active_page_index =
             active_page_index_after_add(self.active_page_index, new_index, was_empty, activate);
         // Only pages that actually became active update the session binding;
-        // background-registered pages must never overwrite it.
-        if self.active_page_index == new_index {
+        // background-registered pages must never overwrite it. A pinned
+        // session shares its browser, so the first seeded page is usually
+        // another session's tab: a page added without activation must never
+        // capture the binding (and with it, ownership) even when the manager
+        // was empty. Legacy sessions keep the upstream behavior of binding
+        // the first page.
+        if self.active_page_index == new_index && (activate || !self.pin_tab) {
             self.bind_active_target();
         }
     }
@@ -5321,8 +5356,11 @@ mod tests {
         assert!(mgr.bound_target_is_gone());
         let err = mgr.active_session_id().unwrap_err();
         assert!(err.starts_with(TAB_GONE_PREFIX));
-        // Recovery data is intact: the other tab is still listed.
-        assert_eq!(mgr.tab_list().len(), 1);
+        // Recovery data is intact: the foreign tab is still tracked (so a
+        // later ownership decision can see it), but a pinned session lists
+        // only its own tabs.
+        assert!(mgr.has_target(TARGET_B));
+        assert_eq!(mgr.tab_list().len(), 0);
     }
 
     #[tokio::test]
@@ -5390,7 +5428,12 @@ mod tests {
         // "Close the current tab" must not close the fallback neighbor.
         let err = mgr.tab_close(None, None).await.unwrap_err();
         assert!(err.starts_with(TAB_GONE_PREFIX));
-        assert_eq!(mgr.tab_list().len(), 1);
+        assert!(mgr.has_target(TARGET_B));
+        assert_eq!(
+            mgr.tab_list().len(),
+            0,
+            "a pinned session lists only its own tabs; the foreign tab stays tracked but hidden"
+        );
     }
 
     #[tokio::test]
@@ -5422,7 +5465,144 @@ mod tests {
 
         assert_eq!(mgr.active_target_id().unwrap(), TARGET_A);
         assert_eq!(mgr.bound_target_id(), Some(TARGET_A));
+        assert!(
+            mgr.has_target(TARGET_B),
+            "the foreign tab stays tracked for ownership decisions"
+        );
+        assert_eq!(
+            mgr.tab_list().len(),
+            1,
+            "a pinned session lists only its own tabs"
+        );
+    }
+
+    /// Seeding a pinned session with another session's tabs must bind and own
+    /// nothing: the attach bootstrap registers every existing page without
+    /// activation, and the first seed used to capture the binding (and with
+    /// it, ownership) through the was-empty path. That leak let one pinned
+    /// session own another's tab, so `wait --download` claimed foreign
+    /// downloads.
+    #[tokio::test]
+    async fn test_pinned_bootstrap_with_foreign_pages_binds_and_owns_nothing() {
+        let mut mgr = test_manager(vec![]).await;
+        mgr.set_pin_tab(true);
+        // Simulate the attach bootstrap: every existing page is registered
+        // without activation, starting from an empty manager.
+        mgr.add_page_without_activation(page(1, TARGET_A, "https://foreign.example"));
+        mgr.add_page_without_activation(page(2, TARGET_B, "https://foreign2.example"));
+
+        assert_eq!(
+            mgr.bound_target_id(),
+            None,
+            "a seeded foreign tab must not capture the pin binding"
+        );
+        assert!(
+            mgr.owned_targets().is_empty(),
+            "a seeded foreign tab must not enter the owned set"
+        );
+        assert!(
+            mgr.has_target(TARGET_A) && mgr.has_target(TARGET_B),
+            "foreign tabs stay tracked for ownership decisions"
+        );
+        assert_eq!(
+            mgr.tab_list().len(),
+            0,
+            "a pinned session with no own tabs lists nothing"
+        );
+    }
+
+    /// Legacy sessions keep upstream behavior: the first seeded page binds.
+    #[tokio::test]
+    async fn test_legacy_bootstrap_binds_first_seeded_page() {
+        let mut mgr = test_manager(vec![]).await;
+        mgr.add_page_without_activation(page(1, TARGET_A, "https://mine.example"));
+
+        assert_eq!(mgr.bound_target_id(), Some(TARGET_A));
+        assert!(mgr.owned_targets().contains(TARGET_A));
+        assert_eq!(mgr.tab_list().len(), 1);
+    }
+
+    /// A pinned session's `tab list` covers only its owned targets, never
+    /// the whole shared browser.
+    #[tokio::test]
+    async fn test_pinned_tab_list_shows_only_owned_targets() {
+        let mut mgr = test_manager(vec![
+            page(1, TARGET_A, "https://mine.example"),
+            page(2, TARGET_B, "https://foreign.example"),
+        ])
+        .await;
+        mgr.set_pin_tab(true);
+        assert!(mgr.restore_target_binding(TARGET_A, "https://mine.example"));
+
+        let tabs = mgr.tab_list();
+        assert_eq!(tabs.len(), 1, "only the owned tab is listed");
+        assert_eq!(tabs[0]["targetId"], TARGET_A);
+        assert_eq!(tabs[0]["active"], true);
+    }
+
+    /// A legacy session keeps listing every tracked tab.
+    #[tokio::test]
+    async fn test_legacy_tab_list_shows_all_tracked_tabs() {
+        let mut mgr = test_manager(vec![
+            page(1, TARGET_A, "https://mine.example"),
+            page(2, TARGET_B, "https://foreign.example"),
+        ])
+        .await;
+        assert!(mgr.restore_target_binding(TARGET_A, "https://mine.example"));
+
         assert_eq!(mgr.tab_list().len(), 2);
+    }
+
+    /// Switching to a tab the pinned session does not own is refused: a
+    /// foreign tab joins the owned set by adoption or explicit creation,
+    /// never by switching to it.
+    #[tokio::test]
+    async fn test_pinned_tab_switch_to_foreign_tab_is_refused() {
+        let mut mgr = test_manager(vec![
+            page(1, TARGET_A, "https://mine.example"),
+            page(2, TARGET_B, "https://foreign.example"),
+        ])
+        .await;
+        mgr.set_pin_tab(true);
+        assert!(mgr.restore_target_binding(TARGET_A, "https://mine.example"));
+
+        let err = mgr.tab_switch(1, None).await.unwrap_err();
+        assert!(err.contains("not owned"), "unexpected error: {err}");
+        assert_eq!(
+            mgr.active_target_id().unwrap(),
+            TARGET_A,
+            "a refused switch must not move the session"
+        );
+        assert!(
+            !mgr.owned_targets().contains(TARGET_B),
+            "a refused switch must not own the foreign tab"
+        );
+    }
+
+    /// A pinned session cannot resolve a foreign tab either, so `tab close`
+    /// and `tab keep` stay within its own tabs too.
+    #[tokio::test]
+    async fn test_pinned_resolve_tab_ref_refuses_foreign_tabs() {
+        let mut mgr = test_manager(vec![
+            page(1, TARGET_A, "https://mine.example"),
+            page(2, TARGET_B, "https://foreign.example"),
+        ])
+        .await;
+        mgr.set_pin_tab(true);
+        assert!(mgr.restore_target_binding(TARGET_A, "https://mine.example"));
+
+        let err = mgr
+            .resolve_tab_ref(&TabRef::parse("t2").unwrap())
+            .unwrap_err();
+        assert!(err.contains("not owned"), "unexpected error: {err}");
+        let err = mgr
+            .resolve_tab_ref(&TabRef::parse(TARGET_B).unwrap())
+            .unwrap_err();
+        assert!(err.contains("not owned"), "unexpected error: {err}");
+        assert_eq!(
+            mgr.resolve_tab_ref(&TabRef::parse("t1").unwrap()).unwrap(),
+            1
+        );
     }
 
     /// Calls the REAL production function `BrowserManager::register_discovered_page`
@@ -5519,8 +5699,8 @@ mod tests {
         );
         assert_eq!(
             mgr.tab_list().len(),
-            2,
-            "the foreign tab must still be registered so it shows in `tab list`"
+            1,
+            "the foreign tab must stay tracked but hidden from the pinned `tab list`"
         );
     }
 
@@ -5589,7 +5769,16 @@ mod tests {
         );
         assert!(
             newly_added,
-            "the foreign tab is still registered so it shows in `tab list`"
+            "an untracked target must be registered for tracking"
+        );
+        assert!(
+            mgr.has_target(TARGET_B),
+            "the foreign tab stays tracked for ownership decisions"
+        );
+        assert_eq!(
+            mgr.tab_list().len(),
+            0,
+            "a gone pinned session lists no tabs; the foreign tab stays hidden"
         );
 
         assert!(
@@ -6578,8 +6767,11 @@ mod tests {
         assert_eq!(mgr.pages.len(), 2);
         mgr.set_pin_tab(true);
         mgr.set_own_window(true);
+        // The shared browser's seeded tabs belong to other sessions; the
+        // background session can only switch to a tab it owns.
+        mgr.add_page(page(3, "T-THREE", "https://three.example"));
 
-        tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+        tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(2, None))
             .await
             .expect("tab_switch must not hang")
             .expect("switching tabs in a background window should succeed");
@@ -6602,8 +6794,11 @@ mod tests {
         let (url, bring_to_front, _) = start_mock_cdp_browser_counting_focus().await;
         let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
         mgr.set_pin_tab(true);
+        // The shared browser's seeded tabs belong to other sessions; the
+        // pinned session can only switch to a tab it owns.
+        mgr.add_page(page(3, "T-THREE", "https://three.example"));
 
-        tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+        tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(2, None))
             .await
             .expect("tab_switch must not hang")
             .expect("switching tabs in a pinned session should succeed");
@@ -6615,7 +6810,7 @@ mod tests {
         );
         assert_eq!(
             mgr.active_target_id().unwrap(),
-            "T-TWO",
+            "T-THREE",
             "the session-local pointer still moves to the switched tab"
         );
     }

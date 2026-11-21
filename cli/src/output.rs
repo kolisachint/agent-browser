@@ -3445,7 +3445,9 @@ overrides before their first document loads.
 Each session remembers its active tab (bound by CDP target id) and returns
 to it after a daemon restart. With --pin-tab, commands fail with a
 `tab_gone` error instead of falling back to another tab when the bound tab
-is closed. JSON output includes code=tab_gone, data.targetId, and an
+is closed. A pinned session's `tab list` shows only its own tabs (its bound
+tab, tabs it opened, popups it adopted), and `tab <ref>`, `tab close`, and
+`tab keep` refuse another session's tab. JSON output includes code=tab_gone, data.targetId, and an
 optional sanitized data.lastUrl; batch output uses result for the recovery
 object. Recover with `tab new` or `tab list`. The pin is sticky per session;
 pass --no-pin-tab to turn it off again.
