@@ -893,11 +893,8 @@ pub struct DaemonState {
     /// Whether the session owns its own window via `window new`. Sticky per
     /// session: persisted in the binding file so a restart keeps the context.
     pub own_window: bool,
-    /// Owned tabs, browser context, and browser identity restored from the
-    /// binding file before the browser attaches; moved into the manager on
-    /// attach.
-    owned_snapshot: Vec<String>,
-    context_snapshot: Option<String>,
+    /// Browser identity restored from the binding file before the browser
+    /// attaches; moved into the manager on attach.
     browser_snapshot: Option<String>,
     /// Last binding written to disk, so persistence is write-on-change.
     last_persisted_binding: Option<tab_binding::TabBinding>,
@@ -972,11 +969,6 @@ impl DaemonState {
             settings.set(Key::PinTab, Value::Bool(true));
         }
         let own_window = binding.as_ref().is_some_and(|b| b.own_window);
-        let owned_snapshot = binding
-            .as_ref()
-            .map(|b| b.owned_targets.clone())
-            .unwrap_or_default();
-        let context_snapshot = binding.as_ref().and_then(|b| b.browser_context_id.clone());
         let browser_snapshot = binding.as_ref().and_then(|b| b.browser_id.clone());
         // A session bound to a CDP endpoint reattaches to that same endpoint
         // after its daemon dies; a private browser is never launched instead.
@@ -1086,8 +1078,6 @@ impl DaemonState {
             confirmed_policy_actions: HashSet::new(),
             pin_tab,
             own_window,
-            owned_snapshot,
-            context_snapshot,
             browser_snapshot,
             last_persisted_binding: None,
             settings,
@@ -4151,7 +4141,15 @@ async fn apply_tab_binding_on_attach(state: &mut DaemonState) -> Result<bool, St
         if state.own_window {
             mgr.set_own_window(true);
         }
-        let owned: std::collections::HashSet<String> = state.owned_snapshot.drain(..).collect();
+        // Ownership and context come from the binding loaded above on every
+        // attach: a second attach in the same daemon (after a connection
+        // drop) must restore the same ownership instead of emptying it.
+        let owned: std::collections::HashSet<String> = binding
+            .as_ref()
+            .map(|b| b.owned_targets.iter().cloned().collect())
+            .unwrap_or_default();
+        let context_id: Option<String> =
+            binding.as_ref().and_then(|b| b.browser_context_id.clone());
         if pin {
             // Discovery ran before the pin was known, so the bootstrap bound
             // the first listed target (usually another session's tab on a
@@ -4164,7 +4162,7 @@ async fn apply_tab_binding_on_attach(state: &mut DaemonState) -> Result<bool, St
             merged.extend(owned);
             mgr.set_owned_targets(merged);
         }
-        if let Some(context_id) = state.context_snapshot.take() {
+        if let Some(context_id) = context_id {
             mgr.set_browser_context_id(Some(context_id));
         }
         // Refuse to continue in a different browser sharing the same port,
@@ -7191,8 +7189,6 @@ async fn close_session(state: &mut DaemonState, forget_settings: bool) -> Result
     // window, and the browser identity so the next session under this name
     // starts fresh instead of reattaching to a browser it no longer owns.
     state.own_window = false;
-    state.owned_snapshot.clear();
-    state.context_snapshot = None;
     state.browser_snapshot = None;
     if let Ok(Some(mut binding)) = tab_binding::load(&state.session_id) {
         binding.cdp = None;
@@ -17433,8 +17429,10 @@ mod tests {
             },
         )
         .unwrap();
-        // No startup snapshot: this daemon already attached once.
+        // No startup snapshot: this daemon already attached once, so the
+        // attach resumes the persisted binding.
         assert_eq!(state.browser_snapshot, None);
+        state.attached_target = Some(super::AttachedTarget::CdpPort(19999));
         state.own_window = true;
         let client = crate::native::cdp::client::CdpClient::connect(&url)
             .await
@@ -17551,9 +17549,10 @@ mod tests {
         state.own_window = true;
         // Explicit --cdp on this launch: the endpoint did not come from the
         // persisted binding.
-        state
-            .settings
-            .set(Key::Cdp, json!("ws://127.0.0.1:19999/devtools/browser/BROWSER-NEW"));
+        state.settings.set(
+            Key::Cdp,
+            json!("ws://127.0.0.1:19999/devtools/browser/BROWSER-NEW"),
+        );
         state.attached_target = Some(super::AttachedTarget::CdpPort(19999));
         let client = crate::native::cdp::client::CdpClient::connect(&url)
             .await
@@ -17621,6 +17620,87 @@ mod tests {
             .expect("a legacy session must accept a different browser");
         // The stale binding falls back to the live tab and is cleared.
         assert_eq!(load(&state.session_id).unwrap(), None);
+    }
+
+    /// A second attach in the same daemon restores ownership and context
+    /// from the binding on every attach.
+    #[tokio::test]
+    async fn reattach_in_the_same_daemon_keeps_ownership_and_context() {
+        use super::super::tab_binding::{save, TabBinding};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        async fn mock_url(browser_id: &str) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "ws://127.0.0.1:{}/devtools/browser/{browser_id}",
+                listener.local_addr().unwrap().port()
+            );
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let cmd: Value = serde_json::from_str(&text).unwrap();
+                    let id = cmd["id"].clone();
+                    let reply = serde_json::json!({ "id": id, "result": {} });
+                    if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            url
+        }
+
+        let (_env, mut state) = isolated_state();
+        state.session_id = "same-daemon-reattach".to_string();
+        save(
+            &state.session_id,
+            &TabBinding {
+                target_id: "TABOWNED0123456789".to_string(),
+                url: "https://example.com/".to_string(),
+                pinned: true,
+                own_window: false,
+                cdp: Some("19999".to_string()),
+                owned_targets: vec!["TABOWNED0123456789".to_string()],
+                browser_context_id: Some("CTX-KEEP".to_string()),
+                browser_id: Some("BROWSER-KEEP".to_string()),
+            },
+        )
+        .unwrap();
+        state.attached_target = Some(super::AttachedTarget::CdpPort(19999));
+
+        let url = mock_url("BROWSER-KEEP").await;
+        let client = crate::native::cdp::client::CdpClient::connect(&url)
+            .await
+            .unwrap();
+        state.browser = Some(super::BrowserManager::for_test(client, url));
+        super::apply_tab_binding_on_attach(&mut state)
+            .await
+            .unwrap();
+        let mgr = state.browser.as_ref().unwrap();
+        assert!(mgr.owned_targets().contains("TABOWNED0123456789"));
+        assert_eq!(mgr.browser_context_id(), Some("CTX-KEEP"));
+
+        // Second attach in the same daemon: the binding still carries
+        // ownership and context, so both are restored again.
+        let url = mock_url("BROWSER-KEEP").await;
+        let client = crate::native::cdp::client::CdpClient::connect(&url)
+            .await
+            .unwrap();
+        state.browser = Some(super::BrowserManager::for_test(client, url));
+        super::apply_tab_binding_on_attach(&mut state)
+            .await
+            .unwrap();
+        let mgr = state.browser.as_ref().unwrap();
+        assert!(
+            mgr.owned_targets().contains("TABOWNED0123456789"),
+            "ownership must survive a second attach in the same daemon"
+        );
+        assert_eq!(
+            mgr.browser_context_id(),
+            Some("CTX-KEEP"),
+            "context must survive a second attach in the same daemon"
+        );
     }
 
     #[tokio::test]
