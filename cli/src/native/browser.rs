@@ -1699,8 +1699,24 @@ impl BrowserManager {
     /// is enforced. The first command to a just-started browser can fail
     /// while its session handling initializes, so fast failures are retried
     /// within a bounded budget instead of silently adopting a browser that
-    /// should have been refused.
-    pub async fn browser_identity(&self) -> Option<String> {
+    /// should have been refused — but only when an expected identity exists
+    /// (a persisted `browser_id` to compare against). Without one, a single
+    /// attempt decides, so fast failures on a just-started browser no
+    /// longer burn the retry budget on every attach. The attempt keeps the
+    /// 6 s bound so endpoints that never answer (proxied connections)
+    /// cannot stall the attach on the much longer command timeout.
+    pub async fn browser_identity(&self, expected: Option<&str>) -> Option<String> {
+        if expected.is_none() {
+            let probe = tokio::time::timeout(
+                Duration::from_secs(6),
+                self.client.send_command("Browser.getVersion", None, None),
+            )
+            .await;
+            if !matches!(probe, Ok(Ok(_))) {
+                return None;
+            }
+            return Self::browser_id_from_version_url(&self.ws_url);
+        }
         let answered = tokio::time::timeout(Duration::from_secs(6), async {
             loop {
                 let probe: Result<serde_json::Value, String> = self
@@ -3974,7 +3990,7 @@ mod tests {
         let client = CdpClient::connect(&url).await.unwrap();
         let mgr = BrowserManager::for_test(client, url);
         assert_eq!(
-            mgr.browser_identity().await.as_deref(),
+            mgr.browser_identity(None).await.as_deref(),
             Some("MOCK-BROWSER-ID")
         );
     }
@@ -3984,7 +4000,56 @@ mod tests {
         let url = start_mock_cdp_version_endpoint(true).await;
         let client = CdpClient::connect(&url).await.unwrap();
         let mgr = BrowserManager::for_test(client, url);
-        assert_eq!(mgr.browser_identity().await, None);
+        assert_eq!(mgr.browser_identity(None).await, None);
+    }
+
+    /// With an expected identity the probe retries fast failures (the
+    /// first commands to a just-started browser can fail while its
+    /// session handling initializes) instead of giving up immediately.
+    #[tokio::test]
+    async fn browser_identity_retries_while_an_identity_is_expected() {
+        let failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(2));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!(
+            "ws://127.0.0.1:{port}/devtools/browser/MOCK-BROWSER-ID",
+            port = port
+        );
+        tokio::spawn(async move {
+            use futures_util::{SinkExt, StreamExt};
+            use tokio_tungstenite::tungstenite::Message;
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let msg: Value = serde_json::from_str(&text).unwrap();
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                // Fail fast twice (an error reply, not a dropped message:
+                // a dropped reply would stall on the command timeout, not
+                // the retry), then answer like a warmed-up browser.
+                let reply = if failures.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
+                    serde_json::json!({
+                        "id": id,
+                        "error": { "message": "session handling not ready" }
+                    })
+                } else {
+                    serde_json::json!({
+                        "id": id,
+                        "result": { "protocolVersion": "1.3", "product": "Chrome/120.0" }
+                    })
+                };
+                ws.send(Message::Text(reply.to_string()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mgr = BrowserManager::for_test(client, url);
+        assert_eq!(
+            mgr.browser_identity(Some("MOCK-BROWSER-ID"))
+                .await
+                .as_deref(),
+            Some("MOCK-BROWSER-ID")
+        );
     }
 
     /// Starts a mock browser-level CDP endpoint that records the params of

@@ -4283,14 +4283,16 @@ async fn apply_tab_binding_on_attach(state: &mut DaemonState) -> Result<bool, St
         let strict = pin || state.own_window;
         let from_persisted = !explicit_endpoint && state.attached_target.is_some();
         let persisted_id = binding.as_ref().and_then(|b| b.browser_id.clone());
-        let current_id = Box::pin(mgr.browser_identity()).await;
-        mgr.set_browser_id(current_id.clone());
+        // The probe retries only while an identity is expected; without one
+        // a single attempt decides and the attach stays fast.
         let expected: Option<String> = if !explicit_endpoint && from_persisted && strict {
             state.browser_snapshot.take().or(persisted_id)
         } else {
             let _ = state.browser_snapshot.take();
             None
         };
+        let current_id = Box::pin(mgr.browser_identity(expected.as_deref())).await;
+        mgr.set_browser_id(current_id.clone());
         if let Some(expected) = expected {
             if let Some(current) = current_id {
                 if current != expected {
