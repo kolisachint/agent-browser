@@ -5070,7 +5070,7 @@
         "openWorldHint": true,
         "readOnlyHint": false
       },
-      "description": "Open a new browser window.",
+      "description": "Open a new browser window owned by the session; later tab switches stay in that window and never take focus.",
       "inputSchema": {
         "properties": {
           "session": {
