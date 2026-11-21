@@ -796,6 +796,7 @@ async fn test_daemon_state_new_reads_sticky_pinned_binding() {
             target_id: "ABCDEF0123456789".to_string(),
             url: "https://example.com".to_string(),
             pinned: true,
+            own_window: false,
         },
     )
     .unwrap();
@@ -836,6 +837,7 @@ async fn test_pin_tab_false_disables_persisted_pin_across_restart() {
             target_id: "ABCDEF0123456789".to_string(),
             url: "https://example.com".to_string(),
             pinned: true,
+            own_window: false,
         },
     )
     .unwrap();
@@ -896,6 +898,7 @@ fn pin_binding(pinned: bool) -> super::tab_binding::TabBinding {
         target_id: "ABCDEF0123456789".to_string(),
         url: "https://example.com".to_string(),
         pinned,
+        own_window: false,
     }
 }
 

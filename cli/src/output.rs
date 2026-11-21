@@ -3486,7 +3486,10 @@ agent-browser window - Manage browser windows
 
 Usage: agent-browser window <operation>
 
-Manage browser windows.
+Manage browser windows. A window opened with `window new` belongs to the
+session: later tab switches stay inside it and never take focus from other
+sessions, while focus emulation keeps input and screenshots working in the
+background window.
 
 Operations:
   new                  Open new browser window

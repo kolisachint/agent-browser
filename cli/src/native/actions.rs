@@ -811,6 +811,10 @@ pub struct DaemonState {
     /// Sticky per session: persisted in the binding file so later commands
     /// and daemon restarts keep the strict semantics.
     pub pin_tab: bool,
+    /// Whether the session owns its own window via `window new`. Sticky per
+    /// session like `pin_tab`: persisted in the binding file so the session
+    /// stays in background mode across later commands and restarts.
+    pub own_window: bool,
     /// Last binding written to disk, so persistence is write-on-change.
     last_persisted_binding: Option<tab_binding::TabBinding>,
 }
@@ -878,14 +882,14 @@ impl DaemonState {
         let restore = settings.restore();
         // A corrupt binding file is surfaced later, on attach; it does not
         // enable pinning here because its pinned state is unknowable.
-        let pin_tab = settings.pin_tab()
-            || tab_binding::load(&session_id)
-                .ok()
-                .flatten()
-                .is_some_and(|b| b.pinned);
+        let binding = tab_binding::load(&session_id).ok().flatten();
+        let pin_tab = settings.pin_tab() || binding.as_ref().is_some_and(|b| b.pinned);
         if pin_tab {
             settings.set(Key::PinTab, Value::Bool(true));
         }
+        // A session that opened its own window stays in background mode
+        // across daemon restarts without repeating `window new`.
+        let own_window = binding.is_some_and(|b| b.own_window);
         Self {
             browser: None,
             appium: None,
@@ -986,6 +990,7 @@ impl DaemonState {
             browser_security_checked: None,
             confirmed_policy_actions: HashSet::new(),
             pin_tab,
+            own_window,
             last_persisted_binding: None,
             settings,
             store,
@@ -3957,6 +3962,7 @@ fn maybe_persist_tab_binding(state: &mut DaemonState) -> Option<String> {
         target_id,
         url: tab_binding::sanitize_url(&url),
         pinned: state.pin_tab,
+        own_window: state.own_window,
     };
     if state.last_persisted_binding.as_ref() == Some(&binding) {
         return None;
@@ -4001,6 +4007,12 @@ async fn apply_tab_binding_on_attach(state: &mut DaemonState) -> Result<bool, St
     }
     if let Some(ref mut mgr) = state.browser {
         mgr.set_pin_tab(pin);
+        if state.own_window {
+            // A restored own-window session stays in background mode and
+            // keeps focus emulation; `revive_and_enable_active` below (or
+            // `tab_new`) re-enables domains through `prepare_domains`.
+            mgr.set_own_window(true);
+        }
     }
     let established = match binding {
         Some(b) => {
@@ -4087,11 +4099,16 @@ async fn open_fresh_tab_for_auto_connect(state: &mut DaemonState) -> Result<(), 
         return Ok(());
     };
     mgr.tab_new(None, None).await?;
-    let session_id = mgr.active_session_id()?.to_string();
-    let _ = mgr
-        .client
-        .send_command("Page.bringToFront", None, Some(&session_id))
-        .await;
+    // A pinned session stays in its background window: bringing the fresh
+    // tab to front would steal focus from the other sessions' windows.
+    // Focus emulation (see `prepare_domains`) keeps the page drivable.
+    if !mgr.background_mode() {
+        let session_id = mgr.active_session_id()?.to_string();
+        let _ = mgr
+            .client
+            .send_command("Page.bringToFront", None, Some(&session_id))
+            .await;
+    }
     // Best effort: a failed write is retried after the next command.
     let _ = maybe_persist_tab_binding(state);
     Ok(())
@@ -6378,6 +6395,12 @@ async fn apply_settings_patch(
         state.pin_tab = pin;
         if let Some(ref mut mgr) = state.browser {
             mgr.set_pin_tab(pin);
+            // set_pin_tab only flips the flag; hold focus emulation on the
+            // live pages now so a runtime toggle takes effect immediately
+            // (new pages are covered by `prepare_domains`).
+            if pin {
+                mgr.enable_background_focus().await;
+            }
         }
         // Force a re-persist from the snapshot next time.
         state.last_persisted_binding = None;
@@ -12951,8 +12974,16 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
             title: String::new(),
             target_type: "page".to_string(),
         });
+        // The session now owns its window (the fresh browser context gets
+        // its own window): it stays in the background from here on, with
+        // focus emulation held so input and screenshots keep working.
+        // Covers the new page too (`prepare_domains_pub` ran before the
+        // flag flipped).
+        mgr.set_own_window(true);
+        mgr.enable_background_focus().await;
         (tab_id, attach.session_id)
     };
+    state.own_window = true;
 
     let has_proxy_creds = state.proxy_credentials.read().await.is_some();
     apply_session_setup(state, &session_id).await?;
@@ -17171,6 +17202,7 @@ mod tests {
                 target_id: "ABCDEF0123456789".to_string(),
                 url: "https://example.com".to_string(),
                 pinned: true,
+                own_window: false,
             },
         )
         .unwrap();
@@ -26070,6 +26102,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
                 target_id: "ABCDEF0123456789".to_string(),
                 url: "https://example.com".to_string(),
                 pinned: false,
+                own_window: false,
             },
         )
         .unwrap();

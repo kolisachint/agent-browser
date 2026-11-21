@@ -70,6 +70,8 @@ Every session remembers which tab it is bound to (by CDP target id, persisted in
 
 The flag is sticky per session: pass it once at session creation and later commands keep the strict semantics. Daemon restarts keep the pin; an explicit `close` releases it so other sessions can take the tab, and the next `--pin-tab` command pins again. Pass `--no-pin-tab` to explicitly turn the pin off again. Use each tab's `targetId` from `tab list --json` when one session needs to reference another session's tab; target ids stay stable across daemon restarts.
 
+A pinned session runs in the background: switching tabs never brings anything to front, so parallel pinned sessions stop stealing focus from each other. The same applies after `window new`, which gives the session its own window even without `--pin-tab`. Background sessions hold focus emulation on their tabs automatically, so clicks and screenshots keep working in the background window.
+
 The structured `lastUrl` is limited to sanitized HTTP(S) URLs and `about:blank`. Credentials, query strings, and fragments are removed from HTTP(S) URLs. Opaque URLs such as `data:` are omitted. In batch JSON, the recovery object appears under `result` instead of `data`.
 
 When re-running a shared-tab script such as the repro from #1530, add `--pin-tab` to the first command for every session. Without it, `open` intentionally preserves the legacy behavior and navigates the shared active tab, so the original script still collides. The same rule applies when sessions attach with `--auto-connect` instead of `--cdp`.

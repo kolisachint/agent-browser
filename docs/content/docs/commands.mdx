@@ -360,6 +360,8 @@ In a browser that agent-browser didn't launch (`--cdp` or `--auto-connect`), a l
 
 `tab list` marks a tab with `(live)` or `(frozen)`, and `tab list --json` reports `"keep": "live" | "throttled" | "frozen"` for every tab. `tab keep` uses the Chrome DevTools Protocol, so it isn't available on the WebDriver backend (Safari, iOS).
 
+A session runs in the background once it is pinned to its bound tab (`--pin-tab`) or owns its own window (`window new`): switching tabs then only moves the session-local pointer and never brings anything to front, so parallel sessions sharing one browser stop stealing focus from each other. The session holds focus emulation on its tabs automatically (the same mechanism `tab keep live` uses for a single tab), so clicks and screenshots keep working in the background window.
+
 ### Snapshot deltas
 
 ```bash

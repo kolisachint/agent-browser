@@ -36,6 +36,11 @@ pub struct TabBinding {
     /// Whether strict pin-tab semantics are enabled for this session.
     #[serde(default)]
     pub pinned: bool,
+    /// Whether the session owns its own window via `window new`. Restored
+    /// after a daemon restart so the session stays in background mode
+    /// (no implicit `Page.bringToFront`) without repeating the command.
+    #[serde(default)]
+    pub own_window: bool,
 }
 
 /// Path of the binding file for a session: `{socket_dir}/{session}.target`.
@@ -216,8 +221,14 @@ mod tests {
                 target_id: "4A0B7C4E1F2D3A4B5C6D7E8F90A1B2C3".to_string(),
                 url: "https://example.com/checkout".to_string(),
                 pinned: true,
+                own_window: true,
             };
             save("agent-1", &binding).unwrap();
+            let loaded = load("agent-1").unwrap().unwrap();
+            assert!(
+                loaded.own_window,
+                "own_window must survive a save/load round trip"
+            );
             assert_eq!(load("agent-1"), Ok(Some(binding)));
             clear("agent-1");
             assert_eq!(load("agent-1"), Ok(None));
@@ -231,6 +242,7 @@ mod tests {
                 target_id: "AAAA".to_string(),
                 url: "data:text/html,persisted-secret".to_string(),
                 pinned: true,
+                own_window: false,
             };
 
             save("opaque", &binding).unwrap();
@@ -296,6 +308,7 @@ mod tests {
             target_id: "AAAA".to_string(),
             url: String::new(),
             pinned: true,
+            own_window: false,
         };
         assert!(save("blocked", &binding).is_err());
     }
@@ -309,6 +322,7 @@ mod tests {
                 target_id: "AAAA".to_string(),
                 url: String::new(),
                 pinned: false,
+                own_window: false,
             };
             save("perms", &binding).unwrap();
             let mode = fs::metadata(binding_path("perms"))
@@ -326,6 +340,7 @@ mod tests {
                 target_id: "AAAA".to_string(),
                 url: String::new(),
                 pinned: false,
+                own_window: false,
             };
             save("tmpcheck", &binding).unwrap();
             let dir = binding_path("tmpcheck").parent().unwrap().to_path_buf();
@@ -345,11 +360,13 @@ mod tests {
                 target_id: "AAAA".to_string(),
                 url: String::new(),
                 pinned: false,
+                own_window: false,
             };
             let b = TabBinding {
                 target_id: "BBBB".to_string(),
                 url: String::new(),
                 pinned: true,
+                own_window: true,
             };
             save("session-a", &a).unwrap();
             save("session-b", &b).unwrap();
@@ -395,6 +412,7 @@ mod tests {
                 target_id: target.to_string(),
                 url: String::new(),
                 pinned,
+                own_window: false,
             },
         )
         .unwrap();

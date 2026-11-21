@@ -1478,7 +1478,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_WINDOW_NEW,
             "Window new",
-            "Open a new browser window.",
+            "Open a new browser window owned by the session; later tab switches stay in that window and never take focus.",
             json!({}),
             &[],
         ),

@@ -751,6 +751,11 @@ pub struct BrowserManager {
     /// commands fail with a `tab_gone` error until the agent re-binds via
     /// `tab new` or `tab <ref>`.
     pin_tab: bool,
+    /// True once the session opened its own window via `window new` (a fresh
+    /// browser context). Like `pin_tab`, it puts the session in background
+    /// mode: no implicit `Page.bringToFront`, with focus emulation held on
+    /// so input and screenshots keep working in the background window.
+    own_window: bool,
     /// CDP target id of the tab this session is bound to. Updated whenever
     /// the session creates a tab or explicitly switches tabs; persisted by
     /// the daemon so re-attach selects the same tab instead of index 0.
@@ -971,6 +976,7 @@ impl BrowserManager {
                 next_tab_id: 1,
                 direct_page: false,
                 pin_tab: false,
+                own_window: false,
                 bound_target_id: None,
                 bound_target_gone: None,
                 wedge_suspect: None,
@@ -1082,6 +1088,7 @@ impl BrowserManager {
             next_tab_id: 1,
             direct_page,
             pin_tab: false,
+            own_window: false,
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -1280,6 +1287,19 @@ impl BrowserManager {
         self.client
             .send_command_no_params("Page.enable", Some(session_id))
             .await?;
+        if self.background_mode() {
+            // A background window never comes to front, so hold focus
+            // emulation on the page: input keeps working and screenshots
+            // keep rendering while the window stays behind the others.
+            let _ = self
+                .client
+                .send_command(
+                    "Emulation.setFocusEmulationEnabled",
+                    Some(json!({ "enabled": true })),
+                    Some(session_id),
+                )
+                .await;
+        }
         self.client
             .send_command_no_params("Runtime.enable", Some(session_id))
             .await?;
@@ -1598,6 +1618,45 @@ impl BrowserManager {
 
     pub fn pin_tab(&self) -> bool {
         self.pin_tab
+    }
+
+    /// Mark the session as owning its own window (set after `window new`
+    /// moves the session into a fresh browser context).
+    pub fn set_own_window(&mut self, own: bool) {
+        self.own_window = own;
+    }
+
+    /// Whether the session owns its own window via `window new`.
+    pub fn own_window(&self) -> bool {
+        self.own_window
+    }
+
+    /// Whether the session runs in the background: pinned to its bound tab
+    /// or living in its own window. Background sessions never take focus:
+    /// no implicit `Page.bringToFront`, with focus emulation held on the
+    /// session's pages so input and screenshots keep working while the
+    /// window stays behind other sessions' windows.
+    pub fn background_mode(&self) -> bool {
+        self.pin_tab || self.own_window
+    }
+
+    /// Hold focus emulation on every tracked page so background windows
+    /// keep reporting focus (`document.hasFocus()`, visibility) and keep
+    /// receiving input. Best effort per page: a page whose session is gone
+    /// (a tab closed while the flag flips) must not fail the command.
+    /// New pages are covered by `prepare_domains`, which enables it for
+    /// background sessions at attach time.
+    pub async fn enable_background_focus(&self) {
+        for page in &self.pages {
+            let _ = self
+                .client
+                .send_command(
+                    "Emulation.setFocusEmulationEnabled",
+                    Some(json!({ "enabled": true })),
+                    Some(&page.session_id),
+                )
+                .await;
+        }
     }
 
     /// The target id this session is bound to, if any.
@@ -1982,6 +2041,7 @@ impl BrowserManager {
             next_tab_id: 1,
             direct_page: false,
             pin_tab: false,
+            own_window: false,
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -2477,11 +2537,17 @@ impl BrowserManager {
         // An explicit switch re-binds the session and clears any tab_gone.
         self.bind_active_target();
 
-        // Bring tab to front
-        let _ = self
-            .client
-            .send_command("Page.bringToFront", None, Some(&session_id))
-            .await;
+        // Bring tab to front, unless the session runs in the background
+        // (pinned to its tab, or in its own window): the switch only moves
+        // the session-local pointer while the window stays behind the
+        // others. Focus emulation (see `prepare_domains`) keeps input and
+        // screenshots working there.
+        if !self.background_mode() {
+            let _ = self
+                .client
+                .send_command("Page.bringToFront", None, Some(&session_id))
+                .await;
+        }
 
         // A dialog-blocked tab cannot answer script evaluation until the dialog
         // is resolved, so fall back to the last known url/title instead of
@@ -2692,6 +2758,9 @@ impl BrowserManager {
         Ok(())
     }
 
+    /// Bring the active tab to front. Only used where visibility is
+    /// explicitly required (recording setup); tab switches in background
+    /// sessions intentionally skip this (see `tab_switch`).
     pub async fn bring_to_front(&self) -> Result<(), String> {
         let session_id = self.active_session_id()?;
         self.client
@@ -3189,6 +3258,7 @@ async fn initialize_lightpanda_manager(
             next_tab_id: 1,
             direct_page: false,
             pin_tab: false,
+            own_window: false,
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -3301,6 +3371,7 @@ async fn initialize_obscura_manager(
             next_tab_id: 1,
             direct_page: false,
             pin_tab: false,
+            own_window: false,
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -4253,6 +4324,7 @@ mod tests {
             next_tab_id: 100,
             direct_page: false,
             pin_tab: false,
+            own_window: false,
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -4316,6 +4388,7 @@ mod tests {
             next_tab_id: 1,
             direct_page: false,
             pin_tab: false,
+            own_window: false,
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -5140,6 +5213,28 @@ mod tests {
         assert_eq!(mgr.bound_target_id(), Some(TARGET_B));
     }
 
+    // -------------------------------------------------------------------
+    // Background windows (AB-1)
+    // -------------------------------------------------------------------
+
+    /// `background_mode` is off for a fresh session and turns on either by
+    /// pinning to the bound tab or by owning a window via `window new`.
+    #[tokio::test]
+    async fn test_background_mode_pin_and_own_window() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        assert!(!mgr.background_mode());
+        assert!(!mgr.own_window());
+
+        mgr.set_pin_tab(true);
+        assert!(mgr.background_mode());
+        mgr.set_pin_tab(false);
+        assert!(!mgr.background_mode());
+
+        mgr.set_own_window(true);
+        assert!(mgr.own_window());
+        assert!(mgr.background_mode());
+    }
+
     #[tokio::test]
     async fn test_resolve_tab_ref_by_target_id() {
         let mgr = test_manager(vec![
@@ -5643,6 +5738,166 @@ mod tests {
             activations.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "a responsive tab must not be reactivated"
+        );
+    }
+
+    /// Mock CDP endpoint with two live tabs that counts `Page.bringToFront`
+    /// and `Emulation.setFocusEmulationEnabled` calls, so tests can prove
+    /// background sessions switch tabs without taking focus while still
+    /// holding focus emulation for input and screenshots.
+    async fn start_mock_cdp_browser_counting_focus() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let bring_to_front = Arc::new(AtomicUsize::new(0));
+        let focus_emulation = Arc::new(AtomicUsize::new(0));
+        let bring_to_front_task = bring_to_front.clone();
+        let focus_emulation_task = focus_emulation.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/mock",
+            listener.local_addr().unwrap().port()
+        );
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+
+            while let Some(Ok(msg)) = rx.next().await {
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Ping(p) => {
+                        let _ = tx.send(Message::Pong(p)).await;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let cmd: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(id) = cmd["id"].as_u64() else {
+                    continue;
+                };
+                let method = cmd["method"].as_str().unwrap_or("");
+                let respond = |result: Value| json!({ "id": id, "result": result }).to_string();
+
+                if method == "Page.bringToFront" {
+                    bring_to_front_task.fetch_add(1, Ordering::SeqCst);
+                }
+                if method == "Emulation.setFocusEmulationEnabled" {
+                    focus_emulation_task.fetch_add(1, Ordering::SeqCst);
+                }
+
+                let reply = match method {
+                    "Target.getTargets" => Some(respond(json!({
+                        "targetInfos": [
+                            { "targetId": "T-ONE", "type": "page", "title": "one",
+                              "url": "https://one.test/", "attached": false },
+                            { "targetId": "T-TWO", "type": "page", "title": "two",
+                              "url": "https://two.test/", "attached": false },
+                        ]
+                    }))),
+                    "Target.attachToTarget" => {
+                        let target = cmd["params"]["targetId"].as_str().unwrap_or("");
+                        Some(respond(json!({ "sessionId": format!("S-{}", target) })))
+                    }
+                    "Runtime.evaluate" => Some(respond(
+                        json!({ "result": { "type": "string", "value": "https://two.test/" } }),
+                    )),
+                    _ => Some(respond(json!({}))),
+                };
+                if let Some(r) = reply {
+                    let _ = tx.send(Message::Text(r)).await;
+                }
+            }
+        });
+
+        (url, bring_to_front, focus_emulation)
+    }
+
+    /// A session in background mode (own window) switches tabs without
+    /// calling `Page.bringToFront`, while focus emulation stays enabled so
+    /// input and screenshots keep working in the background window.
+    /// Force-red: restore the unconditional bring-to-front and the count is 1.
+    #[tokio::test]
+    async fn test_tab_switch_background_session_does_not_bring_to_front() {
+        use std::sync::atomic::Ordering;
+        let (url, bring_to_front, focus_emulation) = start_mock_cdp_browser_counting_focus().await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        assert_eq!(mgr.pages.len(), 2);
+        mgr.set_own_window(true);
+
+        tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+            .await
+            .expect("tab_switch must not hang")
+            .expect("switching tabs in a background window should succeed");
+
+        assert_eq!(
+            bring_to_front.load(Ordering::SeqCst),
+            0,
+            "a background session must never call Page.bringToFront"
+        );
+        assert!(
+            focus_emulation.load(Ordering::SeqCst) >= 1,
+            "focus emulation must be held on for background windows"
+        );
+    }
+
+    /// A pinned session switches tabs without taking focus either.
+    #[tokio::test]
+    async fn test_tab_switch_pinned_session_does_not_bring_to_front() {
+        use std::sync::atomic::Ordering;
+        let (url, bring_to_front, _) = start_mock_cdp_browser_counting_focus().await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        mgr.set_pin_tab(true);
+
+        tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+            .await
+            .expect("tab_switch must not hang")
+            .expect("switching tabs in a pinned session should succeed");
+
+        assert_eq!(
+            bring_to_front.load(Ordering::SeqCst),
+            0,
+            "a pinned session must never call Page.bringToFront"
+        );
+        assert_eq!(
+            mgr.active_target_id().unwrap(),
+            "T-TWO",
+            "the session-local pointer still moves to the switched tab"
+        );
+    }
+
+    /// Default single-session behavior is unchanged: switching tabs brings
+    /// the tab to front and does not enable focus emulation.
+    #[tokio::test]
+    async fn test_tab_switch_legacy_session_brings_to_front() {
+        use std::sync::atomic::Ordering;
+        let (url, bring_to_front, focus_emulation) = start_mock_cdp_browser_counting_focus().await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+
+        tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+            .await
+            .expect("tab_switch must not hang")
+            .expect("switching tabs should succeed");
+
+        assert!(
+            bring_to_front.load(Ordering::SeqCst) >= 1,
+            "a default session must still bring the switched tab to front"
+        );
+        assert_eq!(
+            focus_emulation.load(Ordering::SeqCst),
+            0,
+            "a default session must not enable focus emulation"
         );
     }
 
