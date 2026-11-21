@@ -1497,10 +1497,14 @@ fn exchange<S: Read + Write>(
         });
     }
 
+    // Accumulate into bytes, not a `String`: a WouldBlock slice can land
+    // mid-line and split a multibyte UTF-8 char, and `read_line` drops the
+    // partial char's bytes when it errors, corrupting the reply. Bytes
+    // survive every slice; UTF-8 is validated once the line is complete.
     let mut reader = BufReader::new(stream);
-    let mut response_line = String::new();
+    let mut response_bytes = Vec::new();
     loop {
-        match reader.read_line(&mut response_line) {
+        match reader.read_until(b'\n', &mut response_bytes) {
             Ok(_) => break,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e)
@@ -1516,7 +1520,7 @@ fn exchange<S: Read + Write>(
         }
     }
 
-    serde_json::from_str(&response_line)
+    serde_json::from_slice(&response_bytes)
         .map_err(|e| SendError::OutcomeUnknown(format!("Invalid response: {}", e)))
 }
 
@@ -1695,6 +1699,60 @@ mod tests {
         assert!(started.elapsed() >= delay);
         let request = responder.join().unwrap();
         assert_eq!(request, b"{\"id\":\"1\",\"action\":\"url\"}\n");
+    }
+
+    /// A WouldBlock slice that splits a multibyte UTF-8 char must not
+    /// corrupt the reply: bytes accumulate across slices and decode once
+    /// the line is complete.
+    #[test]
+    #[cfg(unix)]
+    fn exchange_keeps_partial_multibyte_chars_across_read_slices() {
+        use std::os::unix::net::UnixStream;
+
+        let reply = "{\"success\":true,\"data\":{\"note\":\"h\u{00e9}llo \u{2713} done\"}}\n";
+        // Split inside the two-byte `é`, so the first slice ends with a
+        // partial UTF-8 char.
+        let split = reply.find('\u{00e9}').unwrap() + 1;
+        assert_eq!(
+            reply.as_bytes()[split] & 0xC0,
+            0x80,
+            "the split must land mid-char"
+        );
+
+        let (client, server) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(READ_SLICE)).unwrap();
+        let delay = READ_SLICE + Duration::from_millis(500);
+        let first = reply.as_bytes()[..split].to_vec();
+        let rest = reply.as_bytes()[split..].to_vec();
+        let responder = thread::spawn(move || {
+            let mut server = server;
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                server.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            server.write_all(&first).unwrap();
+            thread::sleep(delay);
+            server.write_all(&rest).unwrap();
+        });
+
+        let started = Instant::now();
+        let response = exchange(
+            client,
+            b"{\"id\":\"1\",\"action\":\"url\"}\n",
+            started + delay + READ_SLICE,
+        )
+        .expect("a reply split across read slices must parse");
+        responder.join().unwrap();
+        assert!(response.success);
+        assert_eq!(
+            response.data.unwrap()["note"],
+            serde_json::json!("h\u{00e9}llo \u{2713} done")
+        );
     }
 
     /// Past the deadline the read still fails, but the request is written
