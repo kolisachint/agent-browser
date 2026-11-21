@@ -4161,9 +4161,13 @@ async fn apply_tab_binding_on_attach(state: &mut DaemonState) -> Result<bool, St
             mgr.set_browser_context_id(Some(context_id));
         }
         // Refuse to continue in a different browser sharing the same port.
+        // The startup snapshot is consumed by the first attach, so later
+        // attaches in the same daemon compare against the persisted binding
+        // instead; either way a mismatch fails before any tab is adopted.
+        let persisted_id = binding.as_ref().and_then(|b| b.browser_id.clone());
         let current_id = Box::pin(mgr.browser_identity()).await;
         mgr.set_browser_id(current_id.clone());
-        if let Some(expected) = state.browser_snapshot.take() {
+        if let Some(expected) = state.browser_snapshot.take().or(persisted_id) {
             if let Some(current) = current_id {
                 if current != expected {
                     return Err(format!(
@@ -17360,6 +17364,122 @@ mod tests {
         assert_eq!(download["behavior"], "default");
         assert_eq!(download["browserContextId"], "CTX-9");
         assert!(download.get("downloadPath").is_none());
+    }
+
+    /// A reattach that lands on a different browser sharing the same port
+    /// is refused even when the daemon survived (no fresh startup snapshot):
+    /// the persisted binding carries the expected browser identity.
+    #[tokio::test]
+    async fn reattach_refuses_a_different_browser_from_the_persisted_binding() {
+        use super::super::tab_binding::{load, save, TabBinding};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/BROWSER-NEW",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let cmd: Value = serde_json::from_str(&text).unwrap();
+                let id = cmd["id"].clone();
+                let reply = serde_json::json!({ "id": id, "result": {} });
+                if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let (_env, mut state) = isolated_state();
+        state.session_id = "refuse-different-browser".to_string();
+        save(
+            &state.session_id,
+            &TabBinding {
+                target_id: "TABOLD0123456789".to_string(),
+                url: "https://example.com/".to_string(),
+                pinned: false,
+                own_window: true,
+                cdp: Some("19999".to_string()),
+                owned_targets: vec!["TABOLD0123456789".to_string()],
+                browser_context_id: None,
+                browser_id: Some("BROWSER-OLD".to_string()),
+            },
+        )
+        .unwrap();
+        // No startup snapshot: this daemon already attached once.
+        assert_eq!(state.browser_snapshot, None);
+        state.own_window = true;
+        let client = crate::native::cdp::client::CdpClient::connect(&url)
+            .await
+            .unwrap();
+        state.browser = Some(super::BrowserManager::for_test(client, url));
+        let err = super::apply_tab_binding_on_attach(&mut state)
+            .await
+            .expect_err("a different browser on the same port must be refused");
+        assert!(err.contains("different browser"), "unexpected error: {err}");
+        let binding = load(&state.session_id).unwrap().unwrap();
+        assert_eq!(
+            binding.browser_id.as_deref(),
+            Some("BROWSER-OLD"),
+            "the refusal must not overwrite the persisted identity"
+        );
+    }
+
+    /// The same browser (same persisted identity) reattaches without a
+    /// refusal through the persisted binding alone.
+    #[tokio::test]
+    async fn reattach_accepts_the_same_browser_from_the_persisted_binding() {
+        use super::super::tab_binding::{load, save, TabBinding};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/BROWSER-SAME",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let cmd: Value = serde_json::from_str(&text).unwrap();
+                let id = cmd["id"].clone();
+                let reply = serde_json::json!({ "id": id, "result": {} });
+                if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let (_env, mut state) = isolated_state();
+        state.session_id = "accept-same-browser".to_string();
+        save(
+            &state.session_id,
+            &TabBinding {
+                target_id: "TABOLD0123456789".to_string(),
+                url: "https://example.com/".to_string(),
+                pinned: false,
+                own_window: true,
+                cdp: Some("19999".to_string()),
+                owned_targets: vec!["TABOLD0123456789".to_string()],
+                browser_context_id: None,
+                browser_id: Some("BROWSER-SAME".to_string()),
+            },
+        )
+        .unwrap();
+        state.own_window = true;
+        let client = crate::native::cdp::client::CdpClient::connect(&url)
+            .await
+            .unwrap();
+        state.browser = Some(super::BrowserManager::for_test(client, url));
+        super::apply_tab_binding_on_attach(&mut state)
+            .await
+            .expect("the same browser must reattach");
+        let binding = load(&state.session_id).unwrap().unwrap();
+        assert_eq!(binding.browser_id.as_deref(), Some("BROWSER-SAME"));
     }
 
     #[tokio::test]
