@@ -407,6 +407,26 @@ fn resolve_launch_target(cmd: &Value, attached: Option<&AttachedTarget>) -> Opti
     Some(Value::Object(resolved))
 }
 
+/// Whether a settings connection still points at the session's attached
+/// target: re-specifying the same endpoint is not a switch, so the attach
+/// survives a patch that carries it.
+fn attached_target_matches_connection(
+    attached: Option<&AttachedTarget>,
+    connection: &Connection,
+) -> bool {
+    match (attached, connection) {
+        (Some(AttachedTarget::CdpUrl(url)), Connection::Cdp(endpoint)) => url == endpoint,
+        (Some(AttachedTarget::CdpPort(port)), Connection::Cdp(endpoint)) => {
+            endpoint == &port.to_string()
+        }
+        (Some(AttachedTarget::AutoConnect), Connection::AutoConnect) => true,
+        (Some(AttachedTarget::Provider(attached)), Connection::Provider(next)) => {
+            attached.eq_ignore_ascii_case(next)
+        }
+        _ => false,
+    }
+}
+
 /// How many frame-to-session entries the download router keeps. Pruned on
 /// detach events; a missed frame falls back to the unresolvable-owner rule.
 const MAX_DOWNLOAD_FRAMES: usize = 4096;
@@ -939,6 +959,14 @@ pub struct DaemonState {
     browser_snapshot: Option<String>,
     /// Last binding written to disk, so persistence is write-on-change.
     last_persisted_binding: Option<tab_binding::TabBinding>,
+    /// Whether the in-flight launch named its own connection endpoint
+    /// (`--cdp`, `--auto-connect`, `--provider`) instead of inheriting the
+    /// session's attached target. Set by every launch; `None` before any
+    /// launch ran (unit tests that call the attach helpers directly fall
+    /// back to the sticky settings). A reattach seeded from the persisted
+    /// binding inherits its endpoint into the launch, which lands in the
+    /// sticky settings and would otherwise look like an explicit `--cdp`.
+    launch_named_endpoint: Option<bool>,
 }
 
 fn default_idle_shutdown_is_blocked(
@@ -1121,6 +1149,7 @@ impl DaemonState {
             own_window,
             browser_snapshot,
             last_persisted_binding: None,
+            launch_named_endpoint: None,
             settings,
             store,
         }
@@ -4296,10 +4325,17 @@ async fn apply_tab_binding_on_attach(state: &mut DaemonState) -> Result<bool, St
         // The startup snapshot is consumed by the first attach either way,
         // so later attaches in the same daemon compare against the persisted
         // binding instead.
-        let explicit_endpoint = matches!(
+        let settings_claim_an_endpoint = matches!(
             state.settings.connection(),
             Connection::Cdp(_) | Connection::AutoConnect
         );
+        // The launch command's own endpoint counts as explicit; an endpoint
+        // the launch inherited from the attached target (a reattach seeded
+        // from the persisted binding) does not, even though it lands in the
+        // sticky settings. Before any launch ran, fall back to the sticky
+        // settings.
+        let explicit_endpoint =
+            settings_claim_an_endpoint && state.launch_named_endpoint.unwrap_or(true);
         let strict = pin || state.own_window;
         let from_persisted = !explicit_endpoint && state.attached_target.is_some();
         let persisted_id = binding.as_ref().and_then(|b| b.browser_id.clone());
@@ -6231,6 +6267,12 @@ async fn handle_launch_with_deadline(
     state: &mut DaemonState,
     deadline: std::time::Duration,
 ) -> Result<Value, String> {
+    // Record whether this launch names its own connection endpoint. A launch
+    // that inherits the attached target (a reattach seeded from the persisted
+    // binding) resolves that endpoint into the command below, so the attach
+    // helpers consult this instead of the sticky settings, which cannot tell
+    // the two apart once the inherited endpoint lands in them.
+    state.launch_named_endpoint = Some(AttachedTarget::named_by(cmd).is_some());
     let mut resolved = resolve_launch_target(cmd, state.attached_target.as_ref());
     if let Some(launch) = resolved.as_mut() {
         attach_saved_cdp_headers(launch, state);
@@ -6788,7 +6830,12 @@ async fn apply_settings_patch(
             _ => None,
         };
     }
-    if connection_changed {
+    // A reattach seeded from the persisted binding resolves its endpoint into
+    // this patch, which must not drop the very attach it resumes: only a
+    // switch to a different endpoint clears the attached target.
+    if connection_changed
+        && !attached_target_matches_connection(state.attached_target.as_ref(), &next.connection())
+    {
         state.attached_target = None;
     }
     state.settings = next;
@@ -17889,6 +17936,105 @@ mod tests {
         assert_eq!(
             binding.browser_id.as_deref(),
             Some("BROWSER-OLD"),
+            "the refusal must not overwrite the persisted identity"
+        );
+    }
+
+    /// End to end through the launch flow, not just the attach helper: a
+    /// strict session whose daemon restarts (the boot seeds the attached
+    /// target from the persisted binding) and whose endpoint now serves a
+    /// different browser must be refused by a command that names no
+    /// endpoint, without falling back to a private browser. The inherited
+    /// endpoint lands in the sticky settings, so only the launch's
+    /// provenance tells it apart from an explicit `--cdp`.
+    #[tokio::test]
+    async fn persisted_seed_reattach_refuses_a_different_browser_through_launch() {
+        use super::super::tab_binding::{load, save, TabBinding};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ws_url = format!("ws://127.0.0.1:{port}/devtools/browser/BROWSER-NEW-SEED");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                        Ok(ws) => ws,
+                        // The pre-connect TCP probe is not a WebSocket.
+                        Err(_) => return,
+                    };
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let cmd: Value = serde_json::from_str(&text).unwrap();
+                        let method = cmd["method"].as_str().unwrap_or("");
+                        let id = cmd["id"].clone();
+                        let result = match method {
+                            "Target.getTargets" => serde_json::json!({
+                                "targetInfos": [{
+                                    "targetId": "TABSEED0123456789",
+                                    "type": "page",
+                                    "title": "seed",
+                                    "url": "https://example.com/",
+                                }]
+                            }),
+                            "Target.attachToTarget" => {
+                                serde_json::json!({ "sessionId": "MOCK-SEED-SESS" })
+                            }
+                            _ => serde_json::json!({}),
+                        };
+                        let reply = serde_json::json!({ "id": id, "result": result });
+                        if ws.send(Message::Text(reply.to_string())).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let (_env, mut state) = isolated_state();
+        state.session_id = "persisted-seed-refusal".to_string();
+        save(
+            &state.session_id,
+            &TabBinding {
+                target_id: "TABSEED0123456789".to_string(),
+                url: "https://example.com/".to_string(),
+                pinned: true,
+                own_window: false,
+                cdp: Some(ws_url.clone()),
+                owned_targets: vec!["TABSEED0123456789".to_string()],
+                browser_context_id: None,
+                browser_id: Some("BROWSER-OLD-SEED".to_string()),
+            },
+        )
+        .unwrap();
+        // What a fresh boot derives from the binding above: the pin and the
+        // attached target it resumes without any endpoint on the command.
+        state.pin_tab = true;
+        state.attached_target = Some(super::AttachedTarget::CdpUrl(ws_url.clone()));
+
+        // The dispatch reattach path: no command, no endpoint flags.
+        let err = super::auto_launch_with(&mut state, Vec::new(), &Value::Null, false)
+            .await
+            .expect_err("a different browser on the persisted endpoint must be refused");
+        assert!(err.contains("different browser"), "unexpected error: {err}");
+        assert_eq!(
+            state.launch_named_endpoint,
+            Some(false),
+            "the endpoint was inherited from the persisted seed, not named by the launch"
+        );
+        assert!(
+            state.browser.is_none(),
+            "the refusal must tear the connection down instead of launching a private browser"
+        );
+        assert_eq!(
+            state.attached_target,
+            Some(super::AttachedTarget::CdpUrl(ws_url)),
+            "the persisted seed stays attached for the next attempt"
+        );
+        let binding = load(&state.session_id).unwrap().unwrap();
+        assert_eq!(
+            binding.browser_id.as_deref(),
+            Some("BROWSER-OLD-SEED"),
             "the refusal must not overwrite the persisted identity"
         );
     }
