@@ -73,7 +73,7 @@ agent-browser --profile ./b get url
 
 ## Tab pinning in a shared browser
 
-Full isolation applies when each session launches its own browser. When sessions instead share one Chrome over `--cdp`, only the tab selection separates them. Each session remembers which tab it is bound to (by CDP target id, persisted across daemon restarts), so a restarted daemon reattaches to the session's own tab instead of adopting the most recently active one.
+Full isolation applies when each session launches its own browser. When sessions instead share one Chrome over `--cdp`, only the tab selection separates them. Each session remembers which tab it is bound to (by CDP target id, persisted across daemon restarts), so a restarted daemon reattaches to the session's own tab instead of adopting the most recently active one. The session also remembers the CDP endpoint it attached to, so after its daemon dies the next command reattaches to that same endpoint and never launches a private browser instead; when the endpoint is gone the command fails with a clear error. Endpoints carrying credentials, a query string or a fragment are never persisted, and a reattach that lands on a different browser is refused. An explicit `close` forgets the endpoint, so the next session under the same name starts fresh.
 
 Add `--pin-tab` (or set `AGENT_BROWSER_PIN_TAB=1`) to make the binding strict:
 
@@ -82,7 +82,7 @@ agent-browser --session agent1 --cdp 9222 --pin-tab open https://site-a.com
 agent-browser --session agent2 --cdp 9222 --pin-tab open https://site-b.com
 ```
 
-With `--pin-tab`, a session whose bound tab was closed gets a `tab_gone` error instead of silently acting on another session's tab; run `tab new <url>` or pick a tab from `tab list` to recover. JSON output includes <code>"code": "tab_gone"</code>, <code>data.targetId</code>, and optional sanitized <code>data.lastUrl</code>. Batch output uses <code>result</code> for the same recovery object. The flag is sticky per session; pass `--no-pin-tab` to turn it off again. See [CDP Mode](/cdp-mode) for details.
+With `--pin-tab`, a session whose bound tab was closed gets a `tab_gone` error instead of silently acting on another session's tab; run `tab new <url>` or pick a tab from `tab list` to recover. A pinned session's `tab list` shows only its own tabs, and `tab <ref>`, `tab close`, and `tab keep` refuse another session's tab. JSON output includes <code>"code": "tab_gone"</code>, <code>data.targetId</code>, and optional sanitized <code>data.lastUrl</code>. Batch output uses <code>result</code> for the same recovery object. The flag is sticky per session; pass `--no-pin-tab` to turn it off again. A session that owns its window and loses its bound tab reports <code>tab_gone</code> the same way instead of falling back to another session's tab. A pinned session runs in the background: tab switches never bring anything to front, so parallel sessions stop stealing focus from each other, and focus emulation keeps input and screenshots working in the background. See [CDP Mode](/cdp-mode) for details.
 
 Another session cannot take a pinned tab with `tab <ref>` while the pinning session is running (`tab_locked`), and an explicit `close` releases the pin.
 

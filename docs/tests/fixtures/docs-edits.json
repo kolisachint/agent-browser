@@ -84,6 +84,10 @@
       {
         "from": "agent-browser set device <name>       # Emulate device (\"iPhone 14\")",
         "to": "agent-browser set device <name>       # Emulate a device (\"iPhone 14\"): viewport, user agent and touch input (touch events exist after the next navigation)"
+      },
+      {
+        "from": "target ids stay stable across daemon restarts. Each session is bound",
+        "to": "target ids stay stable across daemon restarts. A pinned session lists only its own tabs, and a target id it does not own is refused. Each session is bound"
       }
     ],
     "/configuration": [
@@ -206,6 +210,10 @@
       {
         "from": "Comma-separated allowed domain patterns (e.g., example.com,*.example.com). Requires",
         "to": "Comma-separated allowed domain patterns (e.g., example.com,*.example.com). An empty value is rejected; unset the variable to run unrestricted. Requires"
+      },
+      {
+        "from": "    <tr><td><code>AGENT_BROWSER_DOWNLOAD_PATH</code></td><td>Default directory for browser downloads.</td><td>(temp directory)</td></tr>",
+        "to": "    <tr><td><code>AGENT_BROWSER_DOWNLOAD_PATH</code></td><td>Default directory for browser downloads. A session with its own window keeps its own folder there and only its own downloads are reported to it.</td><td>(temp directory)</td></tr>"
       }
     ],
     "/plugins": [
@@ -346,6 +354,22 @@
       {
         "from": "Session and restore names must contain only alphanumeric characters, hyphens, and underscores. Use agent-browser session id to generate a valid key:",
         "to": "Session and restore names accept Unicode letters and numbers, hyphens, and underscores only. For example, café-東京_7 is valid, while my session is rejected because it contains a space.\n\nUse agent-browser session id to generate a valid key:"
+      },
+      {
+        "from": "run `tab new <url>` or pick a tab from `tab list` to recover. JSON output includes",
+        "to": "run `tab new <url>` or pick a tab from `tab list` to recover. A pinned session's `tab list` shows only its own tabs, and `tab <ref>`, `tab close`, and `tab keep` refuse another session's tab. JSON output includes"
+      },
+      {
+        "from": "run tab new <url> or pick a tab from tab list to recover. JSON output includes",
+        "to": "run tab new <url> or pick a tab from tab list to recover. A pinned session's tab list shows only its own tabs, and tab <ref>, tab close, and tab keep refuse another session's tab. JSON output includes"
+      },
+      {
+        "from": "The flag is sticky per session; pass `--no-pin-tab` to turn it off again. See [CDP Mode](/cdp-mode) for details.",
+        "to": "The flag is sticky per session; pass `--no-pin-tab` to turn it off again. A session that owns its window and loses its bound tab reports <code>tab_gone</code> the same way instead of falling back to another session's tab. A pinned session runs in the background: tab switches never bring anything to front, so parallel sessions stop stealing focus from each other, and focus emulation keeps input and screenshots working in the background. See [CDP Mode](/cdp-mode) for details."
+      },
+      {
+        "from": "The flag is sticky per session; pass --no-pin-tab to turn it off again. See CDP Mode for details.",
+        "to": "The flag is sticky per session; pass --no-pin-tab to turn it off again. A session that owns its window and loses its bound tab reports tab_gone the same way instead of falling back to another session's tab. A pinned session runs in the background: tab switches never bring anything to front, so parallel sessions stop stealing focus from each other, and focus emulation keeps input and screenshots working in the background. See CDP Mode for details."
       }
     ],
     "/skills": [

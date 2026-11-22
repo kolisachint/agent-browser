@@ -34,7 +34,7 @@ Set a default download directory for browser-initiated downloads:
 agent-browser --download-path ./downloads open https://app.example.com
 ```
 
-Without `--download-path`, downloads go to a temporary directory that is cleaned up when the browser closes.
+Without `--download-path`, downloads go to a temporary directory that is cleaned up when the browser closes. A session with its own window keeps its own download folder: a download started in one of its tabs is reported only by that session's `wait --download`.
 
 ## Screenshots and PDFs
 

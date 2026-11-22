@@ -2834,7 +2834,8 @@ Modes:
   --load <state>       Wait for load state (load, domcontentloaded, networkidle)
   --fn <expression>    Wait for JavaScript expression to be truthy
   --text <text>        Wait for text to appear on page (substring match)
-  --download [path]    Wait for a download to complete (optionally save to path)
+  --download [path]    Wait for a download to complete (optionally save to path).
+                       A session with its own window keeps its own download folder
 
 Selector Wait Options:
   --state <state>      visible, hidden, attached, or detached
@@ -3037,7 +3038,9 @@ agent-browser close - Close the browser
 
 Usage: agent-browser close [options]
 
-Closes the browser instance for the current session.
+Closes the browser instance for the current session. Closing also forgets a
+persisted CDP endpoint and the session's own-window state, so the next session
+under this name starts fresh.
 
 Aliases: quit, exit
 
@@ -3442,7 +3445,9 @@ overrides before their first document loads.
 Each session remembers its active tab (bound by CDP target id) and returns
 to it after a daemon restart. With --pin-tab, commands fail with a
 `tab_gone` error instead of falling back to another tab when the bound tab
-is closed. JSON output includes code=tab_gone, data.targetId, and an
+is closed. A pinned session's `tab list` shows only its own tabs (its bound
+tab, tabs it opened, popups it adopted), and `tab <ref>`, `tab close`, and
+`tab keep` refuse another session's tab. JSON output includes code=tab_gone, data.targetId, and an
 optional sanitized data.lastUrl; batch output uses result for the recovery
 object. Recover with `tab new` or `tab list`. The pin is sticky per session;
 pass --no-pin-tab to turn it off again.
@@ -3486,7 +3491,9 @@ agent-browser window - Manage browser windows
 
 Usage: agent-browser window <operation>
 
-Manage browser windows.
+Manage browser windows. A window opened with `window new` belongs to the
+session in its own browser context; only pinned sessions stay in the
+background while the rest keep upstream foreground behavior.
 
 Operations:
   new                  Open new browser window
@@ -4958,6 +4965,10 @@ Options:
   --no-auto-connect          Return a session attached with --auto-connect to a local launch
                              (or --auto-connect false; overrides AGENT_BROWSER_AUTO_CONNECT)
   --cdp <port|url>           Connect via CDP; root WebSocket query slash is optional
+                             The endpoint persists with the session: after its daemon dies
+                             the next command reattaches to it instead of launching
+                             a private browser. Endpoints carrying credentials, a query
+                             or a fragment are never persisted
   --cdp-headers <json>       Headers for --cdp discovery and handshake, e.g. Authorization
                              (or AGENT_BROWSER_CDP_HEADERS env)
   --pin-tab                  Pin the session to its bound tab (or AGENT_BROWSER_PIN_TAB env)

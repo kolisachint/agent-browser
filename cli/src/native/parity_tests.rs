@@ -796,6 +796,11 @@ async fn test_daemon_state_new_reads_sticky_pinned_binding() {
             target_id: "ABCDEF0123456789".to_string(),
             url: "https://example.com".to_string(),
             pinned: true,
+            own_window: false,
+            cdp: None,
+            owned_targets: Vec::new(),
+            browser_context_id: None,
+            browser_id: None,
         },
     )
     .unwrap();
@@ -836,6 +841,11 @@ async fn test_pin_tab_false_disables_persisted_pin_across_restart() {
             target_id: "ABCDEF0123456789".to_string(),
             url: "https://example.com".to_string(),
             pinned: true,
+            own_window: false,
+            cdp: None,
+            owned_targets: Vec::new(),
+            browser_context_id: None,
+            browser_id: None,
         },
     )
     .unwrap();
@@ -896,6 +906,11 @@ fn pin_binding(pinned: bool) -> super::tab_binding::TabBinding {
         target_id: "ABCDEF0123456789".to_string(),
         url: "https://example.com".to_string(),
         pinned,
+        own_window: false,
+        cdp: None,
+        owned_targets: Vec::new(),
+        browser_context_id: None,
+        browser_id: None,
     }
 }
 

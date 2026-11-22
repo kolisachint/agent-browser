@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -751,6 +751,41 @@ pub struct BrowserManager {
     /// commands fail with a `tab_gone` error until the agent re-binds via
     /// `tab new` or `tab <ref>`.
     pin_tab: bool,
+    /// True once the session opened its own window via `window new` (a fresh
+    /// browser context). Records ownership only: unlike `pin_tab` it keeps
+    /// upstream foreground behavior.
+    own_window: bool,
+    /// Browser context created by `window new`, if any. Used for per-context
+    /// download behavior and persisted so a restart keeps the isolation.
+    browser_context_id: Option<String>,
+    /// Identity of the attached browser: the browser-target id from the
+    /// `/json/version` `webSocketDebuggerUrl`, used to refuse a reattach
+    /// that landed on a different browser.
+    browser_id: Option<String>,
+    /// Tabs this session opened itself or adopted (`tab new`, `window new`,
+    /// restored binding, adopted popups, transitively). Popup ownership is
+    /// decided by this set.
+    owned_targets: HashSet<String>,
+    /// Bootstrap tab a pinned attach with no binding opened (`tab new` on
+    /// an empty pin) so the pin has something to bind. `window new` closes
+    /// it while it is still a blank placeholder, once the session owns a
+    /// window, instead of leaking the stray into the tab list.
+    pinned_bootstrap_target: Option<String>,
+    /// Sessions being prepared before their page is registered that must
+    /// not get focus emulation: drained foreign tabs on a pinned session.
+    /// `prepare_domains` runs before `register_discovered_page` in the
+    /// drain, so the page lookup cannot see these yet; the drain marks
+    /// them and registration consumes the mark. At most a drain batch of
+    /// entries lives here at once.
+    foreign_pending_sessions: HashSet<String>,
+    /// Owned targets that just closed, most-recent last. A `target=_blank`
+    /// popup closes when its navigation turns into a download, before
+    /// `wait --download` claims; a download whose stored owner is in here
+    /// still counts as owned by this session. Bounded. Boxed so the
+    /// manager stays small for the launch-path futures (one launch test
+    /// runs at the stack edge in unoptimized builds).
+    #[allow(clippy::box_collection)]
+    recently_removed_owned: Box<VecDeque<String>>,
     /// CDP target id of the tab this session is bound to. Updated whenever
     /// the session creates a tab or explicitly switches tabs; persisted by
     /// the daemon so re-attach selects the same tab instead of index 0.
@@ -971,6 +1006,13 @@ impl BrowserManager {
                 next_tab_id: 1,
                 direct_page: false,
                 pin_tab: false,
+                own_window: false,
+                browser_context_id: None,
+                browser_id: None,
+                owned_targets: HashSet::new(),
+                pinned_bootstrap_target: None,
+                foreign_pending_sessions: HashSet::new(),
+                recently_removed_owned: Box::new(VecDeque::new()),
                 bound_target_id: None,
                 bound_target_gone: None,
                 wedge_suspect: None,
@@ -1082,6 +1124,13 @@ impl BrowserManager {
             next_tab_id: 1,
             direct_page,
             pin_tab: false,
+            own_window: false,
+            browser_context_id: None,
+            browser_id: None,
+            owned_targets: HashSet::new(),
+            pinned_bootstrap_target: None,
+            foreign_pending_sessions: HashSet::new(),
+            recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -1147,6 +1196,7 @@ impl BrowserManager {
                     "Target.createTarget",
                     &CreateTargetParams {
                         url: "about:blank".to_string(),
+                        browser_context_id: None,
                     },
                     None,
                 )
@@ -1169,12 +1219,15 @@ impl BrowserManager {
             self.pages.push(PageInfo {
                 tab_id,
                 label: None,
-                target_id: result.target_id,
+                target_id: result.target_id.clone(),
                 session_id: attach_result.session_id.clone(),
                 url: "about:blank".to_string(),
                 title: String::new(),
                 target_type: "page".to_string(),
             });
+            // The session created this tab: popups opened from it belong
+            // to this session even before any binding is established.
+            self.owned_targets.insert(result.target_id);
             self.active_page_index = 0;
             self.bind_active_target();
             self.enable_domains(&attach_result.session_id).await?;
@@ -1280,6 +1333,29 @@ impl BrowserManager {
         self.client
             .send_command_no_params("Page.enable", Some(session_id))
             .await?;
+        // Only on tabs this session owns: drained foreign tabs share the
+        // browser but belong to another session.
+        let foreign = match self.pages.iter().find(|page| page.session_id == session_id) {
+            Some(page) => !self.owned_targets.contains(&page.target_id),
+            // A session id the manager has not registered yet is usually
+            // a tab this session is still creating (`tab_new` prepares
+            // domains before it tracks the page): it is ours, so it keeps
+            // the emulation — unless the drain marked it foreign.
+            None => self.foreign_pending_sessions.contains(session_id),
+        };
+        if self.pin_tab && !foreign {
+            // A background window never comes to front, so hold focus
+            // emulation on the page: input keeps working and screenshots
+            // keep rendering while the window stays behind the others.
+            let _ = self
+                .client
+                .send_command(
+                    "Emulation.setFocusEmulationEnabled",
+                    Some(json!({ "enabled": true })),
+                    Some(session_id),
+                )
+                .await;
+        }
         self.client
             .send_command_no_params("Runtime.enable", Some(session_id))
             .await?;
@@ -1392,6 +1468,13 @@ impl BrowserManager {
             .await;
         let was_bound = self.bound_target_id.as_deref() == Some(target_id.as_str());
         self.tab_keep.remove(&target_id);
+        // The replacement tab is created by this session (see below), so it
+        // inherits ownership of the tab it replaces. The replaced id is
+        // still remembered so a download it started keeps its owner.
+        if self.owned_targets.remove(target_id.as_str()) {
+            self.remember_removed_owned(target_id.as_str());
+            self.owned_targets.insert(replacement.0.clone());
+        }
         let page = &mut self.pages[self.active_page_index];
         page.url = "about:blank".to_string();
         page.title.clear();
@@ -1430,6 +1513,7 @@ impl BrowserManager {
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: "about:blank".to_string(),
+                    browser_context_id: self.browser_context_id.clone(),
                 },
                 None,
             )
@@ -1600,6 +1684,178 @@ impl BrowserManager {
         self.pin_tab
     }
 
+    /// Record the bootstrap tab a pinned attach with no binding opened;
+    /// `window new` takes and closes it once the session owns a window.
+    pub fn set_pinned_bootstrap_target(&mut self, target_id: Option<String>) {
+        self.pinned_bootstrap_target = target_id;
+    }
+
+    pub fn take_pinned_bootstrap_target(&mut self) -> Option<String> {
+        self.pinned_bootstrap_target.take()
+    }
+
+    pub fn set_own_window(&mut self, own: bool) {
+        self.own_window = own;
+    }
+
+    pub fn own_window(&self) -> bool {
+        self.own_window
+    }
+
+    pub fn set_browser_context_id(&mut self, id: Option<String>) {
+        self.browser_context_id = id;
+    }
+
+    pub fn browser_context_id(&self) -> Option<&str> {
+        self.browser_context_id.as_deref()
+    }
+
+    pub fn set_browser_id(&mut self, id: Option<String>) {
+        self.browser_id = id;
+    }
+
+    pub fn browser_id(&self) -> Option<&str> {
+        self.browser_id.as_deref()
+    }
+
+    /// Identity of the currently attached browser: the browser-target id at
+    /// the end of the `/json/version` `webSocketDebuggerUrl` (which is the
+    /// WebSocket URL this manager connected through, modulo host and port).
+    /// `Browser.getVersion` never reports that URL, so the command is only a
+    /// liveness probe: `None` when the endpoint does not answer (proxied
+    /// connections), in which case no identity is persisted and no refusal
+    /// is enforced. The first command to a just-started browser can fail
+    /// while its session handling initializes, so fast failures are retried
+    /// within a bounded budget instead of silently adopting a browser that
+    /// should have been refused — but only when an expected identity exists
+    /// (a persisted `browser_id` to compare against). Without one, a single
+    /// attempt decides, so fast failures on a just-started browser no
+    /// longer burn the retry budget on every attach. The attempt keeps the
+    /// 6 s bound so endpoints that never answer (proxied connections)
+    /// cannot stall the attach on the much longer command timeout.
+    pub async fn browser_identity(&self, expected: Option<&str>) -> Option<String> {
+        if expected.is_none() {
+            let probe = tokio::time::timeout(
+                Duration::from_secs(6),
+                self.client.send_command("Browser.getVersion", None, None),
+            )
+            .await;
+            if !matches!(probe, Ok(Ok(_))) {
+                return None;
+            }
+            return Self::browser_id_from_version_url(&self.ws_url);
+        }
+        let answered = tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                let probe: Result<serde_json::Value, String> = self
+                    .client
+                    .send_command("Browser.getVersion", None, None)
+                    .await;
+                if probe.is_ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !answered {
+            return None;
+        }
+        Self::browser_id_from_version_url(&self.ws_url)
+    }
+
+    /// Background mode is opt-in via `--pin-tab` only. Background sessions
+    /// never take focus: no implicit `Page.bringToFront`, with focus
+    /// emulation held on owned tabs.
+    pub fn background_mode(&self) -> bool {
+        self.pin_tab
+    }
+
+    fn owned_session_ids(&self) -> Vec<String> {
+        self.pages
+            .iter()
+            .filter(|p| self.owned_targets.contains(&p.target_id))
+            .map(|p| p.session_id.clone())
+            .collect()
+    }
+
+    /// Hold focus emulation on owned tabs only. Best effort per page.
+    pub async fn enable_background_focus(&self) {
+        for session_id in self.owned_session_ids() {
+            let _ = self
+                .client
+                .send_command(
+                    "Emulation.setFocusEmulationEnabled",
+                    Some(json!({ "enabled": true })),
+                    Some(&session_id),
+                )
+                .await;
+        }
+    }
+
+    /// Release focus emulation when pin is turned off.
+    pub async fn disable_background_focus(&self) {
+        for session_id in self.owned_session_ids() {
+            let _ = self
+                .client
+                .send_command(
+                    "Emulation.setFocusEmulationEnabled",
+                    Some(json!({ "enabled": false })),
+                    Some(&session_id),
+                )
+                .await;
+        }
+    }
+
+    pub fn owned_targets(&self) -> &HashSet<String> {
+        &self.owned_targets
+    }
+
+    pub fn set_owned_targets(&mut self, owned: HashSet<String>) {
+        self.owned_targets = owned;
+    }
+
+    /// Mark a session being prepared as foreign before its page is
+    /// registered, so `prepare_domains` skips focus emulation on it.
+    /// The drain calls this for root targets on a pinned session: they
+    /// are prepared before `register_discovered_page` records them, and
+    /// would otherwise look like tabs this session is still creating
+    /// (which keep the emulation). Registration consumes the mark.
+    pub fn mark_session_foreign(&mut self, session_id: &str) {
+        self.foreign_pending_sessions.insert(session_id.to_string());
+    }
+
+    /// Remember a just-closed owned target so a download whose owner was
+    /// resolved while the tab was alive still counts as owned after the
+    /// tab closes (a `target=_blank` download popup closes itself).
+    /// Bounded: the oldest entry is dropped past the cap.
+    fn remember_removed_owned(&mut self, target_id: &str) {
+        const MAX_RECENTLY_REMOVED_OWNED: usize = 64;
+        if let Some(pos) = self
+            .recently_removed_owned
+            .iter()
+            .position(|entry| entry == target_id)
+        {
+            self.recently_removed_owned.remove(pos);
+        }
+        self.recently_removed_owned.push_back(target_id.to_string());
+        while self.recently_removed_owned.len() > MAX_RECENTLY_REMOVED_OWNED {
+            self.recently_removed_owned.pop_front();
+        }
+    }
+
+    /// Whether `target_id` is owned by this session now or closed recently
+    /// while owned. Strict download claims accept either; anything else
+    /// belongs to another session (or was never owned).
+    pub fn is_owned_or_recently_removed(&self, target_id: &str) -> bool {
+        self.owned_targets.contains(target_id)
+            || self
+                .recently_removed_owned
+                .iter()
+                .any(|entry| entry == target_id)
+    }
+
     /// The target id this session is bound to, if any.
     pub fn bound_target_id(&self) -> Option<&str> {
         self.bound_target_id.as_deref()
@@ -1640,6 +1896,9 @@ impl BrowserManager {
             .pages
             .get(self.active_page_index)
             .map(|p| p.target_id.clone());
+        if let Some(ref bound) = self.bound_target_id.clone() {
+            self.owned_targets.insert(bound.clone());
+        }
         self.bound_target_gone = None;
     }
 
@@ -1652,10 +1911,13 @@ impl BrowserManager {
             self.active_page_index = index;
             self.bound_target_id = Some(target_id.to_string());
             self.bound_target_gone = None;
+            // The restored tab came from this session's own binding file:
+            // it is this session's tab, so its popups belong here.
+            self.owned_targets.insert(target_id.to_string());
             return true;
         }
         self.bound_target_id = None;
-        if self.pin_tab {
+        if self.pin_tab || self.own_window {
             self.bound_target_gone =
                 Some((target_id.to_string(), tab_binding::sanitize_url(last_url)));
         }
@@ -1982,6 +2244,13 @@ impl BrowserManager {
             next_tab_id: 1,
             direct_page: false,
             pin_tab: false,
+            own_window: false,
+            browser_context_id: None,
+            browser_id: None,
+            owned_targets: HashSet::new(),
+            pinned_bootstrap_target: None,
+            foreign_pending_sessions: HashSet::new(),
+            recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -2055,6 +2324,7 @@ impl BrowserManager {
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: "about:blank".to_string(),
+                    browser_context_id: self.browser_context_id.clone(),
                 },
                 None,
             )
@@ -2118,6 +2388,10 @@ impl BrowserManager {
         self.pages
             .iter()
             .enumerate()
+            // A pinned session shares its browser with other sessions: its
+            // tab list covers only the tabs it owns (bound tab, tabs it
+            // opened, popups it adopted), never the whole browser.
+            .filter(|(_, p)| !self.pin_tab || self.owned_targets.contains(&p.target_id))
             .map(|(i, p)| {
                 json!({
                     "tabId": format_tab_id(p.tab_id),
@@ -2307,6 +2581,23 @@ impl BrowserManager {
     /// Resolve a user-supplied `TabRef` (either `t<N>` or a label) to the
     /// stable numeric `tab_id`. Returns a teaching error for unknown tabs.
     pub fn resolve_tab_ref(&self, tab_ref: &TabRef) -> Result<u32, String> {
+        let tab_id = self.resolve_tab_ref_unscoped(tab_ref)?;
+        if self.pin_tab {
+            let owned = self
+                .pages
+                .iter()
+                .find(|p| p.tab_id == tab_id)
+                .is_some_and(|p| self.owned_targets.contains(&p.target_id));
+            if !owned {
+                return Err(format!(
+                    "Tab {tab_ref:?} is not owned by this pinned session; run `tab list` to see its own tabs",
+                ));
+            }
+        }
+        Ok(tab_id)
+    }
+
+    fn resolve_tab_ref_unscoped(&self, tab_ref: &TabRef) -> Result<u32, String> {
         match tab_ref {
             TabRef::Id(id) => {
                 if self.has_tab_id(*id) {
@@ -2400,6 +2691,7 @@ impl BrowserManager {
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: target_url.to_string(),
+                    browser_context_id: self.browser_context_id.clone(),
                 },
                 None,
             )
@@ -2433,6 +2725,9 @@ impl BrowserManager {
             title: String::new(),
             target_type: "page".to_string(),
         });
+        // Explicitly created by this session (`tab new`, `click --new-tab`):
+        // popups opened from it belong here even when it is not active.
+        self.owned_targets.insert(target_id.clone());
         self.active_page_index = index;
         self.bind_active_target();
 
@@ -2457,6 +2752,15 @@ impl BrowserManager {
                 self.pages.len().saturating_sub(1)
             ));
         }
+        // A pinned session switches only within its own tabs; a foreign tab
+        // joins the owned set by adoption (a popup of an owned opener) or
+        // explicit creation, never by switching to it.
+        if self.pin_tab && !self.owned_targets.contains(&self.pages[index].target_id) {
+            return Err(format!(
+                "Tab {} is not owned by this pinned session; run `tab list` to see its own tabs",
+                format_tab_id(index as u32)
+            ));
+        }
 
         let session_id = self.pages[index].session_id.clone();
         let target_id = self.pages[index].target_id.clone();
@@ -2477,11 +2781,17 @@ impl BrowserManager {
         // An explicit switch re-binds the session and clears any tab_gone.
         self.bind_active_target();
 
-        // Bring tab to front
-        let _ = self
-            .client
-            .send_command("Page.bringToFront", None, Some(&session_id))
-            .await;
+        // Bring tab to front, unless the session runs in the background
+        // (pinned to its tab, or in its own window): the switch only moves
+        // the session-local pointer while the window stays behind the
+        // others. Focus emulation (see `prepare_domains`) keeps input and
+        // screenshots working there.
+        if !self.pin_tab {
+            let _ = self
+                .client
+                .send_command("Page.bringToFront", None, Some(&session_id))
+                .await;
+        }
 
         // A dialog-blocked tab cannot answer script evaluation until the dialog
         // is resolved, so fall back to the last known url/title instead of
@@ -2544,6 +2854,9 @@ impl BrowserManager {
 
         let page = self.pages.remove(target_index);
         self.tab_keep.remove(&page.target_id);
+        if self.owned_targets.remove(&page.target_id) {
+            self.remember_removed_owned(&page.target_id);
+        }
         self.update_active_page_after_removal(target_index);
         let closed_tab_id = page.tab_id;
         let closed_label = page.label.clone();
@@ -2692,6 +3005,9 @@ impl BrowserManager {
         Ok(())
     }
 
+    /// Bring the active tab to front. Only used where visibility is
+    /// explicitly required (recording setup); tab switches in background
+    /// sessions intentionally skip this (see `tab_switch`).
     pub async fn bring_to_front(&self) -> Result<(), String> {
         let session_id = self.active_session_id()?;
         self.client
@@ -2889,6 +3205,9 @@ impl BrowserManager {
     /// commands (`window new`, recording setup) where the new page should
     /// become active.
     pub fn add_page(&mut self, page: PageInfo) {
+        // Explicitly created by this session (`window new`, recording
+        // setup): popups opened from it belong here even when it is idle.
+        self.owned_targets.insert(page.target_id.clone());
         self.add_page_with_activation(page, true);
     }
 
@@ -2913,8 +3232,13 @@ impl BrowserManager {
         self.active_page_index =
             active_page_index_after_add(self.active_page_index, new_index, was_empty, activate);
         // Only pages that actually became active update the session binding;
-        // background-registered pages must never overwrite it.
-        if self.active_page_index == new_index {
+        // background-registered pages must never overwrite it. A pinned
+        // session shares its browser, so the first seeded page is usually
+        // another session's tab: a page added without activation must never
+        // capture the binding (and with it, ownership) even when the manager
+        // was empty. Legacy sessions keep the upstream behavior of binding
+        // the first page.
+        if self.active_page_index == new_index && (activate || !self.pin_tab) {
             self.bind_active_target();
         }
     }
@@ -2938,6 +3262,11 @@ impl BrowserManager {
     pub fn remove_page_by_target_id(&mut self, target_id: &str) {
         if let Some(pos) = self.pages.iter().position(|p| p.target_id == target_id) {
             let page = self.pages.remove(pos);
+            self.foreign_pending_sessions
+                .remove(page.session_id.as_str());
+            if self.owned_targets.remove(&page.target_id) {
+                self.remember_removed_owned(&page.target_id);
+            }
             self.tab_keep.remove(target_id);
             self.update_active_page_after_removal(pos);
             // If the destroyed target was the bound tab (closed externally,
@@ -2951,13 +3280,39 @@ impl BrowserManager {
         self.pages.iter().any(|p| p.target_id == target_id)
     }
 
+    /// Whether `opener_id` names a tab this session owns (its bound tab,
+    /// tabs it opened, popups it adopted, transitively).
+    pub fn owns_opener(&self, opener_id: &str) -> bool {
+        !opener_id.is_empty() && self.owned_targets.contains(opener_id)
+    }
+
+    /// Whether this session should adopt a newly discovered `target`.
+    /// Legacy sessions keep upstream behavior (adopt everything). Pinned
+    /// sessions adopt a popup only when they own its opener; unknown or
+    /// foreign openers are skipped so one agent's popup never enters
+    /// another agent's tab list.
+    pub fn should_adopt_discovered_target(&self, target: &TargetInfo) -> bool {
+        match target.opener_id.as_deref().filter(|s| !s.is_empty()) {
+            None => true,
+            Some(opener) => {
+                if !self.pin_tab {
+                    return true;
+                }
+                self.owns_opener(opener)
+            }
+        }
+    }
+
     /// Single decision point for both CDP target drains
     /// (`Target.attachedToTarget` and `Target.targetCreated`). A tracked
     /// target only has its metadata refreshed; a new one is appended and
-    /// activated per pin mode: a pinned session never lets a discovered tab
-    /// steal the active tab or pin binding, a legacy session follows it.
-    /// Explicit commands (`tab new`, `window new`, `click --new-tab`) take
-    /// their own `add_page` path. Covered by `test_register_discovered_page_*`.
+    /// activated per background mode: a background session (pinned to its
+    /// tab, or living in its own window) never lets a discovered tab steal
+    /// the active tab or pin binding, a legacy session follows it.
+    /// Popups opened by another session's tab are ignored (see
+    /// `should_adopt_discovered_target`). Explicit commands (`tab new`,
+    /// `window new`, `click --new-tab`) take their own `add_page` path.
+    /// Covered by `test_register_discovered_page_*`.
     pub fn register_discovered_page(
         &mut self,
         target_id: &str,
@@ -2965,16 +3320,24 @@ impl BrowserManager {
         url: String,
         title: String,
         target_type: String,
+        opener_id: Option<&str>,
     ) -> bool {
+        self.foreign_pending_sessions.remove(session_id);
         if let Some(p) = self.pages.iter_mut().find(|p| p.target_id == target_id) {
             p.url = url;
             p.title = title;
             p.target_type = target_type;
             return false;
         }
+        if let Some(opener) = opener_id.filter(|s| !s.is_empty()) {
+            if self.pin_tab && !self.owns_opener(opener) {
+                return false;
+            }
+        }
+        let is_popup = opener_id.is_some_and(|s| !s.is_empty());
         let tab_id = self.assign_tab_id();
-        // Pinned sessions never activate a discovered tab (strict no-steal);
-        // legacy sessions follow it, matching pre-pin behavior.
+        // Pinned sessions never activate a discovered tab; others (including
+        // own-window sessions without --pin-tab) keep upstream behavior.
         let activate = !self.pin_tab;
         self.add_page_with_activation(
             PageInfo {
@@ -2988,6 +3351,20 @@ impl BrowserManager {
             },
             activate,
         );
+        // An adopted popup becomes this session's own tab: popups it opens
+        // in turn carry its id as opener and must route back here even
+        // while it sits idle in the background. Root targets without an
+        // opener are not claimed: every session sharing the browser tracks
+        // those, so owning them here would break popup isolation.
+        if is_popup {
+            self.owned_targets.insert(target_id.to_string());
+        } else if self.own_window && !self.pin_tab {
+            // An own-window session without pin follows a discovered root
+            // tab (upstream behavior), but must not own it: only tabs it
+            // opened or popups it adopted count as owned, so another
+            // session's tab never becomes this session's tab.
+            self.owned_targets.remove(target_id);
+        }
         true
     }
 
@@ -3008,6 +3385,16 @@ impl BrowserManager {
             .map(|p| p.target_id.as_str())
     }
 
+    /// CDP target id for one of this manager's CDP session ids. Every daemon
+    /// attached to a shared browser holds a session per tab, so downloads
+    /// are attributed by target, not by raw session.
+    pub fn target_id_for_session(&self, session_id: &str) -> Option<&str> {
+        self.pages
+            .iter()
+            .find(|p| p.session_id == session_id)
+            .map(|p| p.target_id.as_str())
+    }
+
     /// Returns true if a tab with the given stable `tab_id` is still open.
     pub fn has_tab_id(&self, tab_id: u32) -> bool {
         self.pages.iter().any(|p| p.tab_id == tab_id)
@@ -3019,6 +3406,33 @@ impl BrowserManager {
 
     pub fn visited_origins(&self) -> &HashSet<String> {
         &self.visited_origins
+    }
+
+    /// Per-context download behavior for an own-window session: isolate
+    /// its downloads into its own folder. Never sends `allow` without a
+    /// path; without a folder it keeps the default location with events on.
+    pub async fn apply_own_context_download_path(&mut self, download_path: Option<String>) {
+        self.download_path = download_path;
+        let Some(ref context_id) = self.browser_context_id.clone() else {
+            return;
+        };
+        let params = match self.download_path {
+            Some(ref path) => json!({
+                "behavior": "allow",
+                "downloadPath": path,
+                "browserContextId": context_id,
+                "eventsEnabled": true
+            }),
+            None => json!({
+                "behavior": "default",
+                "browserContextId": context_id,
+                "eventsEnabled": true
+            }),
+        };
+        let _ = self
+            .client
+            .send_command("Browser.setDownloadBehavior", Some(params), None)
+            .await;
     }
 
     /// Keep the configured download location and turn on `Browser.download*`
@@ -3040,18 +3454,33 @@ impl BrowserManager {
 
     pub async fn set_download_behavior(&self, download_path: &str) -> Result<(), String> {
         let session_id = self.active_session_id()?;
+        let mut params = json!({
+            "behavior": "allowAndName",
+            "downloadPath": download_path,
+            "eventsEnabled": true,
+        });
+        if let Some(context_id) = self.browser_context_id.as_deref() {
+            params["browserContextId"] = json!(context_id);
+        }
         self.client
             .send_command(
                 "Browser.setDownloadBehavior",
-                Some(json!({
-                    "behavior": "allowAndName",
-                    "downloadPath": download_path,
-                    "eventsEnabled": true,
-                })),
+                Some(params),
                 Some(session_id),
             )
             .await?;
         Ok(())
+    }
+
+    /// Browser identity for reattach comparison: the last path segment of
+    /// the browser WebSocket URL (the browser-target id). Query strings
+    /// and fragments (forwarded `--cdp` params) are not part of the identity.
+    pub fn browser_id_from_version_url(url: &str) -> Option<String> {
+        let path = url.split(['?', '#']).next().unwrap_or(url);
+        path.rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
     }
 }
 
@@ -3189,6 +3618,13 @@ async fn initialize_lightpanda_manager(
             next_tab_id: 1,
             direct_page: false,
             pin_tab: false,
+            own_window: false,
+            browser_context_id: None,
+            browser_id: None,
+            owned_targets: HashSet::new(),
+            pinned_bootstrap_target: None,
+            foreign_pending_sessions: HashSet::new(),
+            recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -3301,6 +3737,13 @@ async fn initialize_obscura_manager(
             next_tab_id: 1,
             direct_page: false,
             pin_tab: false,
+            own_window: false,
+            browser_context_id: None,
+            browser_id: None,
+            owned_targets: HashSet::new(),
+            pinned_bootstrap_target: None,
+            foreign_pending_sessions: HashSet::new(),
+            recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -3493,6 +3936,347 @@ mod tests {
             Some("[::1]:9222")
         );
         assert_eq!(cdp_port_address("wss://cdp.example.com/session"), None);
+    }
+
+    #[test]
+    fn browser_id_is_the_last_path_segment_without_query_or_fragment() {
+        assert_eq!(
+            BrowserManager::browser_id_from_version_url(
+                "ws://127.0.0.1:9222/devtools/browser/ABCDEF12"
+            )
+            .as_deref(),
+            Some("ABCDEF12")
+        );
+        assert_eq!(
+            BrowserManager::browser_id_from_version_url(
+                "ws://127.0.0.1:9222/devtools/browser/ABCDEF12?mode=Hello"
+            )
+            .as_deref(),
+            Some("ABCDEF12")
+        );
+        assert_eq!(
+            BrowserManager::browser_id_from_version_url("wss://remote:443/session#frag").as_deref(),
+            Some("session")
+        );
+        assert_eq!(
+            BrowserManager::browser_id_from_version_url("ws://127.0.0.1:9222/"),
+            None
+        );
+    }
+
+    /// A mock browser-level CDP endpoint whose URL carries `browser_id`.
+    /// Answers `Browser.getVersion` with the real Chrome shape (which
+    /// reports no debugger URL), or fails it when `fail_version` is set.
+    async fn start_mock_cdp_version_endpoint(fail_version: bool) -> String {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/MOCK-BROWSER-ID",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let ws = match tokio_tungstenite::accept_async(stream).await {
+                Ok(ws) => ws,
+                Err(_) => return,
+            };
+            let (mut tx, mut rx) = ws.split();
+            while let Some(Ok(msg)) = rx.next().await {
+                let text = match msg {
+                    Message::Text(t) => t,
+                    _ => continue,
+                };
+                let cmd: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(id) = cmd["id"].as_u64() else {
+                    continue;
+                };
+                let reply = if cmd["method"] == "Browser.getVersion" && fail_version {
+                    json!({ "id": id, "error": { "message": "not supported" } })
+                } else {
+                    json!({ "id": id, "result": {
+                        "protocolVersion": "1.3",
+                        "product": "Chrome/142.0.0.0",
+                        "revision": "@ABCDEF",
+                        "userAgent": "mock",
+                        "jsVersion": "1.2.3",
+                    } })
+                };
+                if tx.send(Message::Text(reply.to_string())).await.is_err() {
+                    return;
+                }
+            }
+        });
+        url
+    }
+
+    /// Regression test: real `Browser.getVersion` responses carry no
+    /// debugger URL, so the identity must come from the browser WebSocket
+    /// URL (the `/json/version` `webSocketDebuggerUrl` this manager
+    /// connected through). Deriving it from the command result instead
+    /// yields `None` against real Chromium, so the persisted `browser_id`
+    /// is always null and the different-browser refusal never triggers.
+    #[tokio::test]
+    async fn browser_identity_comes_from_the_browser_websocket_url() {
+        let url = start_mock_cdp_version_endpoint(false).await;
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mgr = BrowserManager::for_test(client, url);
+        assert_eq!(
+            mgr.browser_identity(None).await.as_deref(),
+            Some("MOCK-BROWSER-ID")
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_identity_is_none_when_version_does_not_answer() {
+        let url = start_mock_cdp_version_endpoint(true).await;
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mgr = BrowserManager::for_test(client, url);
+        assert_eq!(mgr.browser_identity(None).await, None);
+    }
+
+    /// With an expected identity the probe retries fast failures (the
+    /// first commands to a just-started browser can fail while its
+    /// session handling initializes) instead of giving up immediately.
+    #[tokio::test]
+    async fn browser_identity_retries_while_an_identity_is_expected() {
+        let failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(2));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!(
+            "ws://127.0.0.1:{port}/devtools/browser/MOCK-BROWSER-ID",
+            port = port
+        );
+        tokio::spawn(async move {
+            use futures_util::{SinkExt, StreamExt};
+            use tokio_tungstenite::tungstenite::Message;
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let msg: Value = serde_json::from_str(&text).unwrap();
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                // Fail fast twice (an error reply, not a dropped message:
+                // a dropped reply would stall on the command timeout, not
+                // the retry), then answer like a warmed-up browser.
+                let reply = if failures.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
+                    serde_json::json!({
+                        "id": id,
+                        "error": { "message": "session handling not ready" }
+                    })
+                } else {
+                    serde_json::json!({
+                        "id": id,
+                        "result": { "protocolVersion": "1.3", "product": "Chrome/120.0" }
+                    })
+                };
+                ws.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+        });
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mgr = BrowserManager::for_test(client, url);
+        assert_eq!(
+            mgr.browser_identity(Some("MOCK-BROWSER-ID"))
+                .await
+                .as_deref(),
+            Some("MOCK-BROWSER-ID")
+        );
+    }
+
+    /// Starts a mock browser endpoint that records the session of every
+    /// `Emulation.setFocusEmulationEnabled` call, so tests can prove a
+    /// pinned session holds focus emulation on owned tabs only.
+    async fn start_mock_cdp_recording_focus_sessions(
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let emulated: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let emulated_task = emulated.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/mock",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+            while let Some(Ok(msg)) = rx.next().await {
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Ping(p) => {
+                        let _ = tx.send(Message::Pong(p)).await;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let cmd: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(id) = cmd["id"].as_u64() else {
+                    continue;
+                };
+                let method = cmd["method"].as_str().unwrap_or("");
+                let respond = |result: Value| json!({ "id": id, "result": result }).to_string();
+                if method == "Emulation.setFocusEmulationEnabled" {
+                    if let Some(sid) = cmd.get("sessionId").and_then(|s| s.as_str()) {
+                        emulated_task.lock().unwrap().push(sid.to_string());
+                    }
+                }
+                let reply = match method {
+                    "Target.getTargets" => Some(respond(json!({
+                        "targetInfos": [
+                            { "targetId": "T-ONE", "type": "page", "title": "one",
+                              "url": "https://one.test/", "attached": false },
+                            { "targetId": "T-TWO", "type": "page", "title": "two",
+                              "url": "https://two.test/", "attached": false },
+                        ]
+                    }))),
+                    "Target.attachToTarget" => {
+                        let target = cmd["params"]["targetId"].as_str().unwrap_or("");
+                        Some(respond(json!({ "sessionId": format!("S-{target}") })))
+                    }
+                    _ => Some(respond(json!({}))),
+                };
+                if let Some(r) = reply {
+                    let _ = tx.send(Message::Text(r)).await;
+                }
+            }
+        });
+        (url, emulated)
+    }
+
+    /// A pinned session holds focus emulation on owned tabs only: a
+    /// drained foreign tab shares the browser but belongs to another
+    /// session, so preparing its domains must not emulate focus on it.
+    /// A session the manager has not registered yet is a tab this
+    /// session is still creating, so it keeps the emulation.
+    /// Force-red: emulate unconditionally and the foreign session is
+    /// recorded too.
+    #[tokio::test]
+    async fn test_prepare_domains_pin_emulates_only_owned_tabs() {
+        let (url, emulated) = start_mock_cdp_recording_focus_sessions().await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        // Connect-time setup is not under test.
+        emulated.lock().unwrap().clear();
+        mgr.set_pin_tab(true);
+        mgr.set_owned_targets(["T-ONE".to_string()].into_iter().collect());
+        mgr.prepare_domains_pub("S-T-ONE")
+            .await
+            .expect("prepare owned");
+        mgr.prepare_domains_pub("S-T-TWO")
+            .await
+            .expect("prepare foreign");
+        // A drained foreign tab is prepared before its page is
+        // registered: the drain marks it so it does not look like a tab
+        // this session is still creating.
+        mgr.mark_session_foreign("S-PENDING");
+        mgr.prepare_domains_pub("S-PENDING")
+            .await
+            .expect("prepare marked");
+        mgr.prepare_domains_pub("S-UNKNOWN")
+            .await
+            .expect("prepare unregistered");
+        assert_eq!(
+            *emulated.lock().unwrap(),
+            vec!["S-T-ONE".to_string(), "S-UNKNOWN".to_string()]
+        );
+    }
+
+    /// Starts a mock browser-level CDP endpoint that records the params of
+    /// every `Target.createTarget` call and answers the attach and domain
+    /// commands `tab_new` needs.
+    async fn start_mock_cdp_recording_create_target(
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_task = recorded.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/MOCK-BROWSER-ID",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let ws = match tokio_tungstenite::accept_async(stream).await {
+                Ok(ws) => ws,
+                Err(_) => return,
+            };
+            let (mut tx, mut rx) = ws.split();
+            while let Some(Ok(msg)) = rx.next().await {
+                let text = match msg {
+                    Message::Text(t) => t,
+                    _ => continue,
+                };
+                let cmd: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(id) = cmd["id"].as_u64() else {
+                    continue;
+                };
+                if cmd["method"] == "Target.createTarget" {
+                    recorded_task.lock().unwrap().push(cmd["params"].clone());
+                }
+                let reply = if cmd["method"] == "Target.attachToTarget" {
+                    json!({ "id": id, "result": { "sessionId": "S-1" } })
+                } else if cmd["method"] == "Target.createTarget" {
+                    json!({ "id": id, "result": { "targetId": "T-NEW" } })
+                } else {
+                    json!({ "id": id, "result": {} })
+                };
+                if tx.send(Message::Text(reply.to_string())).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (url, recorded)
+    }
+
+    /// Tabs a session opens must land in its own browser context when
+    /// `window new` created one; otherwise an own-window session's `tab
+    /// new` tabs fall back to the default context and their downloads
+    /// escape the session's download folder.
+    #[tokio::test]
+    async fn tab_new_uses_the_sessions_own_browser_context() {
+        let (url, recorded) = start_mock_cdp_recording_create_target().await;
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mut mgr = BrowserManager::for_test(client, url);
+        mgr.set_browser_context_id(Some("CTX-OWN".to_string()));
+        mgr.tab_new(Some("https://example.com/"), None)
+            .await
+            .unwrap();
+        let params = recorded.lock().unwrap().clone();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0]["url"], "https://example.com/");
+        assert_eq!(params[0]["browserContextId"], "CTX-OWN");
+    }
+
+    #[tokio::test]
+    async fn tab_new_without_an_own_context_omits_browser_context_id() {
+        let (url, recorded) = start_mock_cdp_recording_create_target().await;
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mut mgr = BrowserManager::for_test(client, url);
+        mgr.tab_new(Some("https://example.com/"), None)
+            .await
+            .unwrap();
+        let params = recorded.lock().unwrap().clone();
+        assert_eq!(params.len(), 1);
+        assert!(params[0].get("browserContextId").is_none());
     }
 
     fn free_local_port() -> u16 {
@@ -3716,6 +4500,7 @@ mod tests {
             url: String::new(),
             attached: None,
             browser_context_id: None,
+            opener_id: None,
         };
 
         assert!(should_track_target(&target));
@@ -3730,6 +4515,7 @@ mod tests {
             url: "chrome://newtab/".to_string(),
             attached: None,
             browser_context_id: None,
+            opener_id: None,
         };
 
         assert!(!should_track_target(&target));
@@ -3753,6 +4539,7 @@ mod tests {
             url: "https://example.com/popup".to_string(),
             attached: None,
             browser_context_id: None,
+            opener_id: None,
         };
 
         assert!(update_page_target_info_in_pages(&mut pages, &target));
@@ -4253,6 +5040,13 @@ mod tests {
             next_tab_id: 100,
             direct_page: false,
             pin_tab: false,
+            own_window: false,
+            browser_context_id: None,
+            browser_id: None,
+            owned_targets: HashSet::new(),
+            pinned_bootstrap_target: None,
+            foreign_pending_sessions: HashSet::new(),
+            recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -4316,6 +5110,13 @@ mod tests {
             next_tab_id: 1,
             direct_page: false,
             pin_tab: false,
+            own_window: false,
+            browser_context_id: None,
+            browser_id: None,
+            owned_targets: HashSet::new(),
+            pinned_bootstrap_target: None,
+            foreign_pending_sessions: HashSet::new(),
+            recently_removed_owned: Box::new(VecDeque::new()),
             bound_target_id: None,
             bound_target_gone: None,
             wedge_suspect: None,
@@ -4815,8 +5616,11 @@ mod tests {
         assert!(mgr.bound_target_is_gone());
         let err = mgr.active_session_id().unwrap_err();
         assert!(err.starts_with(TAB_GONE_PREFIX));
-        // Recovery data is intact: the other tab is still listed.
-        assert_eq!(mgr.tab_list().len(), 1);
+        // Recovery data is intact: the foreign tab is still tracked (so a
+        // later ownership decision can see it), but a pinned session lists
+        // only its own tabs.
+        assert!(mgr.has_target(TARGET_B));
+        assert_eq!(mgr.tab_list().len(), 0);
     }
 
     #[tokio::test]
@@ -4884,7 +5688,12 @@ mod tests {
         // "Close the current tab" must not close the fallback neighbor.
         let err = mgr.tab_close(None, None).await.unwrap_err();
         assert!(err.starts_with(TAB_GONE_PREFIX));
-        assert_eq!(mgr.tab_list().len(), 1);
+        assert!(mgr.has_target(TARGET_B));
+        assert_eq!(
+            mgr.tab_list().len(),
+            0,
+            "a pinned session lists only its own tabs; the foreign tab stays tracked but hidden"
+        );
     }
 
     #[tokio::test]
@@ -4916,7 +5725,175 @@ mod tests {
 
         assert_eq!(mgr.active_target_id().unwrap(), TARGET_A);
         assert_eq!(mgr.bound_target_id(), Some(TARGET_A));
+        assert!(
+            mgr.has_target(TARGET_B),
+            "the foreign tab stays tracked for ownership decisions"
+        );
+        assert_eq!(
+            mgr.tab_list().len(),
+            1,
+            "a pinned session lists only its own tabs"
+        );
+    }
+
+    /// Seeding a pinned session with another session's tabs must bind and own
+    /// nothing: the attach bootstrap registers every existing page without
+    /// activation, and the first seed used to capture the binding (and with
+    /// it, ownership) through the was-empty path. That leak let one pinned
+    /// session own another's tab, so `wait --download` claimed foreign
+    /// downloads.
+    #[tokio::test]
+    async fn test_pinned_bootstrap_with_foreign_pages_binds_and_owns_nothing() {
+        let mut mgr = test_manager(vec![]).await;
+        mgr.set_pin_tab(true);
+        // Simulate the attach bootstrap: every existing page is registered
+        // without activation, starting from an empty manager.
+        mgr.add_page_without_activation(page(1, TARGET_A, "https://foreign.example"));
+        mgr.add_page_without_activation(page(2, TARGET_B, "https://foreign2.example"));
+
+        assert_eq!(
+            mgr.bound_target_id(),
+            None,
+            "a seeded foreign tab must not capture the pin binding"
+        );
+        assert!(
+            mgr.owned_targets().is_empty(),
+            "a seeded foreign tab must not enter the owned set"
+        );
+        assert!(
+            mgr.has_target(TARGET_A) && mgr.has_target(TARGET_B),
+            "foreign tabs stay tracked for ownership decisions"
+        );
+        assert_eq!(
+            mgr.tab_list().len(),
+            0,
+            "a pinned session with no own tabs lists nothing"
+        );
+    }
+
+    /// Legacy sessions keep upstream behavior: the first seeded page binds.
+    #[tokio::test]
+    async fn test_legacy_bootstrap_binds_first_seeded_page() {
+        let mut mgr = test_manager(vec![]).await;
+        mgr.add_page_without_activation(page(1, TARGET_A, "https://mine.example"));
+
+        assert_eq!(mgr.bound_target_id(), Some(TARGET_A));
+        assert!(mgr.owned_targets().contains(TARGET_A));
+        assert_eq!(mgr.tab_list().len(), 1);
+    }
+
+    /// A pinned session's `tab list` covers only its owned targets, never
+    /// the whole shared browser.
+    #[tokio::test]
+    async fn test_pinned_tab_list_shows_only_owned_targets() {
+        let mut mgr = test_manager(vec![
+            page(1, TARGET_A, "https://mine.example"),
+            page(2, TARGET_B, "https://foreign.example"),
+        ])
+        .await;
+        mgr.set_pin_tab(true);
+        assert!(mgr.restore_target_binding(TARGET_A, "https://mine.example"));
+
+        let tabs = mgr.tab_list();
+        assert_eq!(tabs.len(), 1, "only the owned tab is listed");
+        assert_eq!(tabs[0]["targetId"], TARGET_A);
+        assert_eq!(tabs[0]["active"], true);
+    }
+
+    /// A just-closed owned tab still counts as owned (bounded): a
+    /// `target=_blank` download popup closes itself before `wait
+    /// --download` claims, and the opener's stored owner must still match.
+    #[tokio::test]
+    async fn test_closed_owned_tab_still_counts_as_owned() {
+        let mut mgr = test_manager(vec![
+            page(1, TARGET_A, "https://mine.example"),
+            page(2, TARGET_B, "https://mine.example/popup"),
+        ])
+        .await;
+        mgr.set_pin_tab(true);
+        mgr.set_owned_targets(
+            [TARGET_A.to_string(), TARGET_B.to_string()]
+                .into_iter()
+                .collect(),
+        );
+
+        mgr.remove_page_by_target_id(TARGET_B);
+
+        assert!(!mgr.owned_targets().contains(TARGET_B));
+        assert!(
+            mgr.is_owned_or_recently_removed(TARGET_B),
+            "a just-closed owned popup still counts as owned"
+        );
+        assert!(mgr.is_owned_or_recently_removed(TARGET_A));
+        assert!(
+            !mgr.is_owned_or_recently_removed("NEVEROWNED000000000000000000000000"),
+            "a target that was never owned is not owned"
+        );
+    }
+
+    /// A legacy session keeps listing every tracked tab.
+    #[tokio::test]
+    async fn test_legacy_tab_list_shows_all_tracked_tabs() {
+        let mut mgr = test_manager(vec![
+            page(1, TARGET_A, "https://mine.example"),
+            page(2, TARGET_B, "https://foreign.example"),
+        ])
+        .await;
+        assert!(mgr.restore_target_binding(TARGET_A, "https://mine.example"));
+
         assert_eq!(mgr.tab_list().len(), 2);
+    }
+
+    /// Switching to a tab the pinned session does not own is refused: a
+    /// foreign tab joins the owned set by adoption or explicit creation,
+    /// never by switching to it.
+    #[tokio::test]
+    async fn test_pinned_tab_switch_to_foreign_tab_is_refused() {
+        let mut mgr = test_manager(vec![
+            page(1, TARGET_A, "https://mine.example"),
+            page(2, TARGET_B, "https://foreign.example"),
+        ])
+        .await;
+        mgr.set_pin_tab(true);
+        assert!(mgr.restore_target_binding(TARGET_A, "https://mine.example"));
+
+        let err = mgr.tab_switch(1, None).await.unwrap_err();
+        assert!(err.contains("not owned"), "unexpected error: {err}");
+        assert_eq!(
+            mgr.active_target_id().unwrap(),
+            TARGET_A,
+            "a refused switch must not move the session"
+        );
+        assert!(
+            !mgr.owned_targets().contains(TARGET_B),
+            "a refused switch must not own the foreign tab"
+        );
+    }
+
+    /// A pinned session cannot resolve a foreign tab either, so `tab close`
+    /// and `tab keep` stay within its own tabs too.
+    #[tokio::test]
+    async fn test_pinned_resolve_tab_ref_refuses_foreign_tabs() {
+        let mut mgr = test_manager(vec![
+            page(1, TARGET_A, "https://mine.example"),
+            page(2, TARGET_B, "https://foreign.example"),
+        ])
+        .await;
+        mgr.set_pin_tab(true);
+        assert!(mgr.restore_target_binding(TARGET_A, "https://mine.example"));
+
+        let err = mgr
+            .resolve_tab_ref(&TabRef::parse("t2").unwrap())
+            .unwrap_err();
+        assert!(err.contains("not owned"), "unexpected error: {err}");
+        let err = mgr
+            .resolve_tab_ref(&TabRef::parse(TARGET_B).unwrap())
+            .unwrap_err();
+        assert!(err.contains("not owned"), "unexpected error: {err}");
+        assert_eq!(
+            mgr.resolve_tab_ref(&TabRef::parse("t1").unwrap()).unwrap(),
+            1
+        );
     }
 
     /// Calls the REAL production function `BrowserManager::register_discovered_page`
@@ -4970,6 +5947,7 @@ mod tests {
             "https://popup.example".to_string(),
             String::new(),
             "page".to_string(),
+            None,
         );
 
         assert!(newly_added, "an untracked target must be registered");
@@ -4996,6 +5974,7 @@ mod tests {
             "https://foreign.example".to_string(),
             String::new(),
             "page".to_string(),
+            None,
         );
 
         assert!(newly_added, "an untracked target must be registered");
@@ -5011,8 +5990,8 @@ mod tests {
         );
         assert_eq!(
             mgr.tab_list().len(),
-            2,
-            "the foreign tab must still be registered so it shows in `tab list`"
+            1,
+            "the foreign tab must stay tracked but hidden from the pinned `tab list`"
         );
     }
 
@@ -5077,10 +6056,20 @@ mod tests {
             "https://foreign.example".to_string(),
             String::new(),
             "page".to_string(),
+            None,
         );
         assert!(
             newly_added,
-            "the foreign tab is still registered so it shows in `tab list`"
+            "an untracked target must be registered for tracking"
+        );
+        assert!(
+            mgr.has_target(TARGET_B),
+            "the foreign tab stays tracked for ownership decisions"
+        );
+        assert_eq!(
+            mgr.tab_list().len(),
+            0,
+            "a gone pinned session lists no tabs; the foreign tab stays hidden"
         );
 
         assert!(
@@ -5113,6 +6102,7 @@ mod tests {
             "https://mine.example/updated".to_string(),
             "Updated Title".to_string(),
             "page".to_string(),
+            None,
         );
 
         assert!(
@@ -5138,6 +6128,397 @@ mod tests {
 
         assert_eq!(mgr.active_target_id().unwrap(), TARGET_B);
         assert_eq!(mgr.bound_target_id(), Some(TARGET_B));
+    }
+
+    // -------------------------------------------------------------------
+    // Background windows (AB-1) and popup ownership (AB-2)
+    // -------------------------------------------------------------------
+
+    /// `background_mode` is opt-in via `--pin-tab` only; `window new`
+    /// records ownership without changing foreground behavior.
+    #[tokio::test]
+    async fn test_background_mode_pin_and_own_window() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        assert!(!mgr.background_mode());
+        assert!(!mgr.own_window());
+
+        mgr.set_pin_tab(true);
+        assert!(mgr.background_mode());
+        mgr.set_pin_tab(false);
+        assert!(!mgr.background_mode());
+
+        mgr.set_own_window(true);
+        assert!(mgr.own_window());
+        assert!(!mgr.background_mode(), "own window alone stays foreground");
+        mgr.set_pin_tab(true);
+        assert!(mgr.background_mode());
+    }
+
+    /// A popup whose opener is this session's active tab is adopted, with
+    /// the legacy activation behavior preserved for non-pinned sessions.
+    #[tokio::test]
+    async fn test_register_discovered_page_adopts_popup_owned_by_active_tab() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        assert_eq!(mgr.active_target_id().unwrap(), TARGET_A);
+
+        let popup = "EEEE0000BBBB1111CCCC2222DDDD3333";
+        let newly_added = mgr.register_discovered_page(
+            popup,
+            "session-popup",
+            "https://popup.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(TARGET_A),
+        );
+
+        assert!(newly_added, "the owner's session must adopt its popup");
+        assert!(
+            mgr.has_target(popup),
+            "the adopted popup must show in the owner's tab list"
+        );
+        assert_eq!(
+            mgr.active_target_id().unwrap(),
+            popup,
+            "legacy activation behavior for owned popups is unchanged"
+        );
+    }
+
+    /// A pinned session adopts a popup opened by its bound tab but, like
+    /// any discovered tab, does not let it steal the active tab.
+    #[tokio::test]
+    async fn test_register_discovered_page_pinned_owner_adopts_popup_inactive() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_pin_tab(true);
+        assert!(mgr.restore_target_binding(TARGET_A, "https://mine.example"));
+
+        let popup = "EEEE0000BBBB1111CCCC2222DDDD3333";
+        let newly_added = mgr.register_discovered_page(
+            popup,
+            "session-popup",
+            "https://popup.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(TARGET_A),
+        );
+
+        assert!(newly_added, "the owner's session must adopt its popup");
+        assert!(mgr.has_target(popup));
+        assert_eq!(
+            mgr.active_target_id().unwrap(),
+            TARGET_A,
+            "the popup must not steal the pinned session's active tab"
+        );
+        assert_eq!(
+            mgr.bound_target_id(),
+            Some(TARGET_A),
+            "the popup must not overwrite the pin binding"
+        );
+    }
+
+    /// A popup opened from the session's own background tab is adopted:
+    /// ownership covers every tab the session opened, not just the active
+    /// or bound one. Force-red: drop the `owned_targets` check and the
+    /// popup is ignored because its opener is idle.
+    #[tokio::test]
+    async fn test_register_discovered_page_adopts_popup_from_own_inactive_tab() {
+        let mut mgr = test_manager(vec![]).await;
+        // Same path as `tab new`: the session opens two tabs, leaving the
+        // first idle in the background.
+        mgr.add_page(page(1, TARGET_A, "https://mine.example"));
+        mgr.add_page(page(2, TARGET_B, "https://other.example"));
+        mgr.set_pin_tab(true);
+        assert_eq!(mgr.active_target_id().unwrap(), TARGET_B);
+
+        let popup = "EEEE0000BBBB1111CCCC2222DDDD3333";
+        let newly_added = mgr.register_discovered_page(
+            popup,
+            "session-popup",
+            "https://popup.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(TARGET_A),
+        );
+
+        assert!(
+            newly_added,
+            "a popup from the session's own background tab must be adopted"
+        );
+        assert!(mgr.has_target(popup));
+        assert_eq!(
+            mgr.active_target_id().unwrap(),
+            TARGET_B,
+            "the popup must not steal the pinned session's active tab"
+        );
+        assert_eq!(
+            mgr.bound_target_id(),
+            Some(TARGET_B),
+            "the popup must not overwrite the pin binding"
+        );
+    }
+
+    /// A popup whose opener is tracked here but owned by another session
+    /// (not opened here, and neither this session's active nor bound tab)
+    /// is ignored: its owner's daemon adopts it on its own drain.
+    #[tokio::test]
+    async fn test_register_discovered_page_ignores_foreign_popup() {
+        let mut mgr = test_manager(vec![
+            page(1, TARGET_A, "https://mine.example"),
+            page(2, TARGET_B, "https://other.example"),
+        ])
+        .await;
+        mgr.set_pin_tab(true);
+        mgr.set_owned_targets([TARGET_A.to_string()].into_iter().collect());
+        // TARGET_A is owned; TARGET_B is tracked but owned elsewhere.
+        assert_eq!(mgr.active_target_id().unwrap(), TARGET_A);
+        assert!(mgr.has_target(TARGET_B));
+        assert!(!mgr.owns_opener(TARGET_B));
+
+        let popup = "EEEE0000BBBB1111CCCC2222DDDD3333";
+        let newly_added = mgr.register_discovered_page(
+            popup,
+            "session-popup",
+            "https://popup.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(TARGET_B),
+        );
+
+        assert!(
+            !newly_added,
+            "a popup owned by another session must be ignored"
+        );
+        assert!(
+            !mgr.has_target(popup),
+            "the foreign popup must not enter this session's tab list"
+        );
+        assert_eq!(mgr.page_count(), 2);
+    }
+
+    /// A popup whose opener is unknown here (e.g. an internal page this
+    /// session filters out) keeps the legacy behavior: adopt per pin mode.
+    #[tokio::test]
+    async fn test_register_discovered_page_adopts_popup_with_unknown_opener() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        assert!(!mgr.has_target("UNKNOWN-OPENER"));
+
+        let popup = "EEEE0000BBBB1111CCCC2222DDDD3333";
+        let newly_added = mgr.register_discovered_page(
+            popup,
+            "session-popup",
+            "https://popup.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some("UNKNOWN-OPENER"),
+        );
+
+        assert!(
+            newly_added,
+            "a popup with an unknown opener must keep the legacy behavior"
+        );
+        assert!(mgr.has_target(popup));
+    }
+
+    /// An own-window session never follows a discovered root tab either:
+    /// activating it would move the session-local pointer out of its own
+    /// window into another session's tab. Force-red: gate activation on
+    /// `pin_tab` only and the active tab is stolen.
+    #[tokio::test]
+    async fn test_register_discovered_page_own_window_ignores_foreign_tab() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_pin_tab(true);
+        mgr.set_own_window(true);
+        assert!(mgr.restore_target_binding(TARGET_A, "https://mine.example"));
+
+        let newly_added = mgr.register_discovered_page(
+            TARGET_B,
+            "session-b",
+            "https://other.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            None,
+        );
+
+        assert!(newly_added, "the tab is still tracked");
+        assert!(mgr.has_target(TARGET_B));
+        assert_eq!(
+            mgr.active_target_id().unwrap(),
+            TARGET_A,
+            "an own-window session must not follow another session's tab"
+        );
+        assert_eq!(mgr.bound_target_id(), Some(TARGET_A));
+    }
+
+    /// An own-window session without pin follows a discovered root tab
+    /// (upstream behavior) but must not own it: only tabs it opened or
+    /// popups it adopted count as owned, so another session's tab never
+    /// becomes this session's tab. Force-red: keep the ownership insert
+    /// and the followed tab leaks into `owned_targets`.
+    #[tokio::test]
+    async fn test_register_discovered_page_own_window_follows_but_does_not_own() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_own_window(true);
+        mgr.set_owned_targets([TARGET_A.to_string()].into_iter().collect());
+
+        let newly_added = mgr.register_discovered_page(
+            TARGET_B,
+            "session-b",
+            "https://other.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            None,
+        );
+
+        assert!(newly_added, "the tab is still followed");
+        assert!(mgr.has_target(TARGET_B));
+        assert_eq!(
+            mgr.active_target_id().unwrap(),
+            TARGET_B,
+            "an own-window session without pin still follows the tab"
+        );
+        assert!(
+            !mgr.owned_targets().contains(TARGET_B),
+            "a followed root tab must not become an owned tab"
+        );
+        assert!(
+            mgr.owned_targets().contains(TARGET_A),
+            "tabs the session already owned stay owned"
+        );
+    }
+
+    /// An own-window session without pin still owns a popup it adopted:
+    /// only followed root tabs stay unowned. Force-red: skip the popup
+    /// ownership insert and adopted popups stop counting as owned.
+    #[tokio::test]
+    async fn test_register_discovered_page_own_window_adopts_popup_as_owned() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_own_window(true);
+        mgr.set_owned_targets([TARGET_A.to_string()].into_iter().collect());
+
+        let popup = "EEEE0000BBBB1111CCCC2222DDDD3333";
+        let newly_added = mgr.register_discovered_page(
+            popup,
+            "session-popup",
+            "https://popup.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(TARGET_A),
+        );
+
+        assert!(newly_added, "the adopted popup is tracked");
+        assert!(mgr.has_target(popup));
+        assert!(
+            mgr.owned_targets().contains(popup),
+            "a popup the session adopted must count as owned"
+        );
+    }
+
+    /// An empty opener id behaves like no opener: the target is adopted.
+    #[tokio::test]
+    async fn test_register_discovered_page_empty_opener_adopts() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_pin_tab(true);
+
+        let newly_added = mgr.register_discovered_page(
+            TARGET_B,
+            "session-b",
+            "https://other.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(""),
+        );
+
+        assert!(newly_added, "an empty opener id must not block adoption");
+        assert!(mgr.has_target(TARGET_B));
+    }
+
+    /// An adopted popup becomes this session's own tab: a popup opened
+    /// from it is adopted here even while the first popup sits idle in
+    /// the background. Force-red: without claiming adopted popups, the
+    /// second popup's opener is tracked but unowned, so it is ignored.
+    #[tokio::test]
+    async fn test_register_discovered_page_adopts_popup_of_adopted_popup() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_pin_tab(true);
+        mgr.set_owned_targets([TARGET_A.to_string()].into_iter().collect());
+
+        let popup = "EEEE0000BBBB1111CCCC2222DDDD3333";
+        assert!(mgr.register_discovered_page(
+            popup,
+            "session-popup",
+            "https://popup.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(TARGET_A),
+        ));
+        assert!(mgr.owns_opener(popup));
+
+        let nested = "FFFF1111CCCC2222DDDD3333EEEE4444";
+        let newly_added = mgr.register_discovered_page(
+            nested,
+            "session-nested",
+            "https://nested.example/".to_string(),
+            String::new(),
+            "page".to_string(),
+            Some(popup),
+        );
+
+        assert!(
+            newly_added,
+            "a popup from an adopted popup must stay with its owner"
+        );
+        assert!(mgr.has_target(nested));
+    }
+
+    /// A pinned session does not adopt a popup whose opener is unknown:
+    /// grandchildren of a skipped foreign popup stay foreign instead of
+    /// leaking in through the unknown-opener path.
+    /// An own-window session whose bound tab is gone reports tab-gone
+    /// instead of falling back to another session's tab.
+    #[tokio::test]
+    async fn test_restore_own_window_missing_tab_is_gone() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_own_window(true);
+        assert!(!mgr.restore_target_binding("MISSING-TARGET", "https://gone.example"));
+        assert!(
+            mgr.bound_target_is_gone(),
+            "an own-window session must not silently adopt another tab"
+        );
+        assert!(mgr.active_target_id().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_register_discovered_page_pinned_unknown_opener_ignored() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        mgr.set_pin_tab(true);
+        mgr.set_owned_targets([TARGET_A.to_string()].into_iter().collect());
+
+        let popup = "EEEE0000BBBB1111CCCC2222DDDD3333";
+        assert!(
+            !mgr.register_discovered_page(
+                popup,
+                "session-popup",
+                "https://popup.example/".to_string(),
+                String::new(),
+                "page".to_string(),
+                Some("UNKNOWN-OPENER"),
+            ),
+            "a pinned session must not adopt a popup with an unknown opener"
+        );
+        assert!(!mgr.has_target(popup));
+
+        let nested = "FFFF1111CCCC2222DDDD3333EEEE4444";
+        assert!(
+            !mgr.register_discovered_page(
+                nested,
+                "session-nested",
+                "https://nested.example/".to_string(),
+                String::new(),
+                "page".to_string(),
+                Some(popup),
+            ),
+            "a descendant of a foreign popup must stay foreign"
+        );
+        assert!(!mgr.has_target(nested));
     }
 
     #[tokio::test]
@@ -5643,6 +7024,192 @@ mod tests {
             activations.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "a responsive tab must not be reactivated"
+        );
+    }
+
+    /// Mock CDP endpoint with two live tabs that counts `Page.bringToFront`
+    /// and `Emulation.setFocusEmulationEnabled` calls, so tests can prove
+    /// background sessions switch tabs without taking focus while still
+    /// holding focus emulation for input and screenshots.
+    async fn start_mock_cdp_browser_counting_focus() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let bring_to_front = Arc::new(AtomicUsize::new(0));
+        let focus_emulation = Arc::new(AtomicUsize::new(0));
+        let bring_to_front_task = bring_to_front.clone();
+        let focus_emulation_task = focus_emulation.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/mock",
+            listener.local_addr().unwrap().port()
+        );
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+
+            while let Some(Ok(msg)) = rx.next().await {
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Ping(p) => {
+                        let _ = tx.send(Message::Pong(p)).await;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let cmd: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(id) = cmd["id"].as_u64() else {
+                    continue;
+                };
+                let method = cmd["method"].as_str().unwrap_or("");
+                let respond = |result: Value| json!({ "id": id, "result": result }).to_string();
+
+                if method == "Page.bringToFront" {
+                    bring_to_front_task.fetch_add(1, Ordering::SeqCst);
+                }
+                if method == "Emulation.setFocusEmulationEnabled" {
+                    focus_emulation_task.fetch_add(1, Ordering::SeqCst);
+                }
+
+                let reply = match method {
+                    "Target.getTargets" => Some(respond(json!({
+                        "targetInfos": [
+                            { "targetId": "T-ONE", "type": "page", "title": "one",
+                              "url": "https://one.test/", "attached": false },
+                            { "targetId": "T-TWO", "type": "page", "title": "two",
+                              "url": "https://two.test/", "attached": false },
+                        ]
+                    }))),
+                    "Target.attachToTarget" => {
+                        let target = cmd["params"]["targetId"].as_str().unwrap_or("");
+                        Some(respond(json!({ "sessionId": format!("S-{}", target) })))
+                    }
+                    "Runtime.evaluate" => Some(respond(
+                        json!({ "result": { "type": "string", "value": "https://two.test/" } }),
+                    )),
+                    _ => Some(respond(json!({}))),
+                };
+                if let Some(r) = reply {
+                    let _ = tx.send(Message::Text(r)).await;
+                }
+            }
+        });
+
+        (url, bring_to_front, focus_emulation)
+    }
+
+    /// A session in background mode (own window) switches tabs without
+    /// calling `Page.bringToFront`, while focus emulation stays enabled so
+    /// input and screenshots keep working in the background window.
+    /// Force-red: restore the unconditional bring-to-front and the count is 1.
+    #[tokio::test]
+    async fn test_tab_switch_background_session_does_not_bring_to_front() {
+        use std::sync::atomic::Ordering;
+        let (url, bring_to_front, focus_emulation) = start_mock_cdp_browser_counting_focus().await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        assert_eq!(mgr.pages.len(), 2);
+        mgr.set_pin_tab(true);
+        mgr.set_own_window(true);
+        // The shared browser's seeded tabs belong to other sessions; the
+        // background session can only switch to a tab it owns.
+        mgr.add_page(page(3, "T-THREE", "https://three.example"));
+
+        tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(2, None))
+            .await
+            .expect("tab_switch must not hang")
+            .expect("switching tabs in a background window should succeed");
+
+        assert_eq!(
+            bring_to_front.load(Ordering::SeqCst),
+            0,
+            "a background session must never call Page.bringToFront"
+        );
+        assert!(
+            focus_emulation.load(Ordering::SeqCst) >= 1,
+            "focus emulation must be held on for background windows"
+        );
+    }
+
+    /// A pinned session switches tabs without taking focus either.
+    #[tokio::test]
+    async fn test_tab_switch_pinned_session_does_not_bring_to_front() {
+        use std::sync::atomic::Ordering;
+        let (url, bring_to_front, _) = start_mock_cdp_browser_counting_focus().await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        mgr.set_pin_tab(true);
+        // The shared browser's seeded tabs belong to other sessions; the
+        // pinned session can only switch to a tab it owns.
+        mgr.add_page(page(3, "T-THREE", "https://three.example"));
+
+        tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(2, None))
+            .await
+            .expect("tab_switch must not hang")
+            .expect("switching tabs in a pinned session should succeed");
+
+        assert_eq!(
+            bring_to_front.load(Ordering::SeqCst),
+            0,
+            "a pinned session must never call Page.bringToFront"
+        );
+        assert_eq!(
+            mgr.active_target_id().unwrap(),
+            "T-THREE",
+            "the session-local pointer still moves to the switched tab"
+        );
+    }
+
+    /// An own-window session without pin keeps upstream foreground behavior.
+    #[tokio::test]
+    async fn test_tab_switch_own_window_without_pin_brings_to_front() {
+        use std::sync::atomic::Ordering;
+        let (url, bring_to_front, _) = start_mock_cdp_browser_counting_focus().await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        mgr.set_own_window(true);
+
+        tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+            .await
+            .expect("tab_switch must not hang")
+            .expect("switching tabs should succeed");
+
+        assert!(
+            bring_to_front.load(Ordering::SeqCst) >= 1,
+            "an own-window session without pin must still bring to front"
+        );
+    }
+
+    /// Default single-session behavior is unchanged: switching tabs brings
+    /// the tab to front and does not enable focus emulation.
+    #[tokio::test]
+    async fn test_tab_switch_legacy_session_brings_to_front() {
+        use std::sync::atomic::Ordering;
+        let (url, bring_to_front, focus_emulation) = start_mock_cdp_browser_counting_focus().await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+
+        tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+            .await
+            .expect("tab_switch must not hang")
+            .expect("switching tabs should succeed");
+
+        assert!(
+            bring_to_front.load(Ordering::SeqCst) >= 1,
+            "a default session must still bring the switched tab to front"
+        );
+        assert_eq!(
+            focus_emulation.load(Ordering::SeqCst),
+            0,
+            "a default session must not enable focus emulation"
         );
     }
 

@@ -79,7 +79,7 @@ This is useful when:
 
 ## Tab pinning
 
-When several sessions share one browser over CDP, each session remembers which tab it is bound to (by CDP target id, persisted across daemon restarts). A restarted daemon reattaches to the session's own tab instead of adopting whatever tab is currently active, which in a shared browser is usually another session's.
+When several sessions share one browser over CDP, each session remembers which tab it is bound to (by CDP target id, persisted across daemon restarts). A restarted daemon reattaches to the session's own tab instead of adopting whatever tab is currently active, which in a shared browser is usually another session's. The session also remembers the CDP endpoint itself, so after its daemon dies the next command reattaches to that same endpoint without needing `--cdp` again, and never launches a private browser instead; when the endpoint is gone the command fails with a clear error instead. Endpoints carrying credentials, a query string or a fragment are never persisted. The session also records the browser's identity and refuses to continue when the endpoint turns out to serve a different browser. An explicit `close` forgets the endpoint.
 
 Pass `--pin-tab` (or set `AGENT_BROWSER_PIN_TAB=1`) to make the binding strict:
 
@@ -95,9 +95,12 @@ With `--pin-tab`:
 - If the bound tab is closed, commands fail with a `tab_gone` error instead of silently acting on another tab. JSON responses carry <code>"code": "tab_gone"</code>, <code>data.targetId</code>, and optional <code>data.lastUrl</code>
 - `tab list`, `tab new`, and `tab <ref>` still work in that state, so an agent can recover by binding a new tab
 - Tabs opened by other sessions or the user never steal the pinned session's active tab
+- `tab list` shows only the session's own tabs (its bound tab, tabs it opened, popups it adopted); `tab <ref>`, `tab close`, and `tab keep` refuse another session's tab
 - Another session cannot take a pinned tab with `tab <ref>` while the pinning session is running; the switch fails with `tab_locked` naming the owner
 
-Chrome throttles a pinned tab that is not the front tab of its window: its timers slow to about one per second and animation frames stop. Run `agent-browser tab keep live` in that session to keep the tab running while it is hidden. See [Background tab modes](/commands#background-tab-modes) for the cost, and for the Chrome flag that gives a browser you started yourself the full timer rate.
+Chrome throttles a pinned tab that is not the front tab of its window: its timers slow to about one per second and animation frames stop. Run `agent-browser tab keep live` in that session to keep the tab running while it is hidden. See [Background tab modes](/commands#background-tab-modes) for the cost, and for the Chrome flag that gives a browser you started yourself the full timer rate. Switching tabs in a pinned session never brings anything to front; focus emulation keeps input and screenshots working in the background.
+
+A popup (a `window.open` call or a `target=_blank` link) is adopted only by the pinned session that owns the tab that opened it: it appears in that session's `tab list` and in no other session's. Switch to it in the owning session to interact with it. Sessions without `--pin-tab` keep the previous behavior and see every popup.
 
 The flag is sticky per session: pass it once and later commands keep the strict semantics. Daemon restarts keep the pin; an explicit close releases it so other sessions can take the tab, and the next pinned command pins again. Pass `--no-pin-tab` to explicitly turn the pin off again. See [Sessions](/sessions) for the multi-session workflow and [Commands](/commands) for tab refs by CDP target id.
 

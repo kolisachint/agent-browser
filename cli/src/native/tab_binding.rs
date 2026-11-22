@@ -36,6 +36,27 @@ pub struct TabBinding {
     /// Whether strict pin-tab semantics are enabled for this session.
     #[serde(default)]
     pub pinned: bool,
+    /// Whether the session owns its own window via `window new`. Restored
+    /// after a daemon restart so the session stays in background mode
+    /// (no implicit `Page.bringToFront`) without repeating the command.
+    #[serde(default)]
+    pub own_window: bool,
+    /// CDP endpoint the session was attached to (`--cdp` value: a ws(s) URL,
+    /// http(s) URL, or port). Only persisted when it carries no credentials,
+    /// query, or fragment. Cleared by an explicit `close`.
+    #[serde(default)]
+    pub cdp: Option<String>,
+    /// Tabs this session owns (bound tab, tabs it opened, adopted popups).
+    /// Restored after a daemon restart so popup ownership survives.
+    #[serde(default)]
+    pub owned_targets: Vec<String>,
+    /// Browser context created by `window new`, if any.
+    #[serde(default)]
+    pub browser_context_id: Option<String>,
+    /// Identity of the attached browser, to refuse a reattach that landed on
+    /// a different browser sharing the same port.
+    #[serde(default)]
+    pub browser_id: Option<String>,
 }
 
 /// Path of the binding file for a session: `{socket_dir}/{session}.target`.
@@ -216,8 +237,18 @@ mod tests {
                 target_id: "4A0B7C4E1F2D3A4B5C6D7E8F90A1B2C3".to_string(),
                 url: "https://example.com/checkout".to_string(),
                 pinned: true,
+                own_window: true,
+                cdp: None,
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
             };
             save("agent-1", &binding).unwrap();
+            let loaded = load("agent-1").unwrap().unwrap();
+            assert!(
+                loaded.own_window,
+                "own_window must survive a save/load round trip"
+            );
             assert_eq!(load("agent-1"), Ok(Some(binding)));
             clear("agent-1");
             assert_eq!(load("agent-1"), Ok(None));
@@ -231,6 +262,11 @@ mod tests {
                 target_id: "AAAA".to_string(),
                 url: "data:text/html,persisted-secret".to_string(),
                 pinned: true,
+                own_window: false,
+                cdp: None,
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
             };
 
             save("opaque", &binding).unwrap();
@@ -296,6 +332,11 @@ mod tests {
             target_id: "AAAA".to_string(),
             url: String::new(),
             pinned: true,
+            own_window: false,
+            cdp: None,
+            owned_targets: Vec::new(),
+            browser_context_id: None,
+            browser_id: None,
         };
         assert!(save("blocked", &binding).is_err());
     }
@@ -309,6 +350,11 @@ mod tests {
                 target_id: "AAAA".to_string(),
                 url: String::new(),
                 pinned: false,
+                own_window: false,
+                cdp: None,
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
             };
             save("perms", &binding).unwrap();
             let mode = fs::metadata(binding_path("perms"))
@@ -326,6 +372,11 @@ mod tests {
                 target_id: "AAAA".to_string(),
                 url: String::new(),
                 pinned: false,
+                own_window: false,
+                cdp: None,
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
             };
             save("tmpcheck", &binding).unwrap();
             let dir = binding_path("tmpcheck").parent().unwrap().to_path_buf();
@@ -345,11 +396,21 @@ mod tests {
                 target_id: "AAAA".to_string(),
                 url: String::new(),
                 pinned: false,
+                own_window: false,
+                cdp: None,
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
             };
             let b = TabBinding {
                 target_id: "BBBB".to_string(),
                 url: String::new(),
                 pinned: true,
+                own_window: true,
+                cdp: None,
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
             };
             save("session-a", &a).unwrap();
             save("session-b", &b).unwrap();
@@ -395,6 +456,11 @@ mod tests {
                 target_id: target.to_string(),
                 url: String::new(),
                 pinned,
+                own_window: false,
+                cdp: None,
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
             },
         )
         .unwrap();
@@ -467,6 +533,41 @@ mod tests {
             fs::write(&path, "{not json").unwrap();
             assert!(release_pin("bad").is_err());
             assert_eq!(fs::read_to_string(&path).unwrap(), "{not json");
+        });
+    }
+
+    #[test]
+    fn cdp_endpoint_round_trips() {
+        with_socket_dir(|| {
+            let binding = TabBinding {
+                target_id: "AAAA".to_string(),
+                url: "https://example.com/".to_string(),
+                pinned: true,
+                own_window: false,
+                cdp: Some("ws://127.0.0.1:9222/devtools/browser/x".to_string()),
+                owned_targets: Vec::new(),
+                browser_context_id: None,
+                browser_id: None,
+            };
+            save("cdp-round-trip", &binding).unwrap();
+            assert_eq!(load("cdp-round-trip").unwrap(), Some(binding));
+        });
+    }
+
+    #[test]
+    fn bindings_without_cdp_load_as_local() {
+        with_socket_dir(|| {
+            let path = binding_path("legacy-no-cdp");
+            fs::write(
+                &path,
+                r#"{"targetId":"AAAA","url":"https://example.com/","pinned":false}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                load("legacy-no-cdp").unwrap().unwrap().cdp,
+                None,
+                "a binding written before AB-4 has no endpoint and stays local"
+            );
         });
     }
 }

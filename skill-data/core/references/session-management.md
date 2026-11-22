@@ -60,19 +60,24 @@ agent-browser --session agent1 --cdp 9222 --pin-tab open https://site-a.com
 agent-browser --session agent2 --cdp 9222 --pin-tab open https://site-b.com
 ```
 
-Every session remembers which tab it is bound to (by CDP target id, persisted in the session's state directory), so a restarted daemon reattaches to the session's own tab instead of adopting the most recently active one. `--pin-tab` (env `AGENT_BROWSER_PIN_TAB=1`) additionally makes the binding strict:
+Every session remembers which tab it is bound to (by CDP target id, persisted in the session's state directory), so a restarted daemon reattaches to the session's own tab instead of adopting the most recently active one. The session also remembers the CDP endpoint it attached to, so after its daemon dies the next command reattaches to that same endpoint without needing `--cdp` again, and never launches a private browser instead; when the endpoint is gone the command fails with a clear error. Endpoints carrying credentials, a query string or a fragment are never persisted, and a reattach that lands on a different browser is refused. An explicit `close` forgets the endpoint, so the next session under the same name starts fresh. `--pin-tab` (env `AGENT_BROWSER_PIN_TAB=1`) additionally makes the binding strict:
 
 - Attaching with no binding opens a fresh tab instead of adopting an existing one
 - If the bound tab is closed, commands fail with a `tab_gone` error instead of silently acting on another tab. JSON output includes `"code": "tab_gone"`, `data.targetId`, and optional `data.lastUrl`
 - Recovery commands still work in that state: run `tab new <url>` to bind a fresh tab, or `tab list` and switch to an existing one
 - Tabs opened by other sessions or the user never steal the pinned session's active tab
+- `tab list` shows only the session's own tabs (its bound tab, tabs it opened, popups it adopted); `tab <ref>`, `tab close`, and `tab keep` refuse another session's tab
 - Another session cannot take a pinned tab with `tab <ref>` while the pinning session is running; the switch fails with `tab_locked` naming the owner
 
-The flag is sticky per session: pass it once at session creation and later commands keep the strict semantics. Daemon restarts keep the pin; an explicit `close` releases it so other sessions can take the tab, and the next `--pin-tab` command pins again. Pass `--no-pin-tab` to explicitly turn the pin off again. Use each tab's `targetId` from `tab list --json` when one session needs to reference another session's tab; target ids stay stable across daemon restarts.
+The flag is sticky per session: pass it once at session creation and later commands keep the strict semantics. Daemon restarts keep the pin; an explicit `close` releases it so other sessions can take the tab, and the next `--pin-tab` command pins again. Pass `--no-pin-tab` to explicitly turn the pin off again. In a session without `--pin-tab`, use each tab's `targetId` from `tab list --json` when one session needs to reference another session's tab; target ids stay stable across daemon restarts. (A pinned session lists only its own tabs and refuses a tab it does not own.)
+
+A pinned session runs in the background: switching tabs never brings anything to front, so parallel pinned sessions stop stealing focus from each other. Background sessions hold focus emulation on their owned tabs automatically, so clicks and screenshots keep working in the background window. A session that only opened its own window (`window new` without `--pin-tab`) keeps upstream foreground behavior.
 
 The structured `lastUrl` is limited to sanitized HTTP(S) URLs and `about:blank`. Credentials, query strings, and fragments are removed from HTTP(S) URLs. Opaque URLs such as `data:` are omitted. In batch JSON, the recovery object appears under `result` instead of `data`.
 
 When re-running a shared-tab script such as the repro from #1530, add `--pin-tab` to the first command for every session. Without it, `open` intentionally preserves the legacy behavior and navigates the shared active tab, so the original script still collides. The same rule applies when sessions attach with `--auto-connect` instead of `--cdp`.
+
+A session with its own window (`window new`) keeps its own download folder (`--download-path`, env `AGENT_BROWSER_DOWNLOAD_PATH`): a download started in one of its tabs is reported only by that session's `wait --download`. `wait --download [path]` moves the file there for a browser agent-browser launched; over a remote endpoint it is rejected.
 
 ## Changing settings on a running session
 
