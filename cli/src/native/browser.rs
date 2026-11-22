@@ -2453,6 +2453,15 @@ impl BrowserManager {
         }
 
         self.apply_keep(&session_id, current, false).await?;
+        // Pinned sessions hold focus emulation on their owned tabs outside
+        // the tab_keep bookkeeping so background input keeps working, and an
+        // emulated page keeps reporting itself visible. Drop it before
+        // waiting for the tab to go hidden; it is put back below unless the
+        // tab ends up frozen (a frozen page needs no input).
+        let pinned_emulation = keep == TabKeep::Frozen && self.pin_tab;
+        if pinned_emulation {
+            self.set_focus_emulation(&session_id, false).await;
+        }
         let entered = async {
             if keep == TabKeep::Frozen && !self.wait_until_hidden(&session_id).await? {
                 return Err(format!(
@@ -2465,15 +2474,41 @@ impl BrowserManager {
         match entered {
             Ok(()) => {
                 self.tab_keep.insert(target_id, keep);
+                if self.pin_tab && keep != TabKeep::Frozen {
+                    // A thawed tab rejoins the pinned background emulation.
+                    self.set_focus_emulation(&session_id, true).await;
+                }
                 Ok(result)
             }
             Err(error) => {
-                if self.apply_keep(&session_id, current, true).await.is_err() {
+                let restore_failed = self.apply_keep(&session_id, current, true).await.is_err();
+                if restore_failed {
                     self.tab_keep.remove(&target_id);
+                }
+                if self.pin_tab
+                    && (pinned_emulation || current != TabKeep::Frozen || restore_failed)
+                {
+                    // The tab is not frozen (the freeze failed, was never
+                    // tried, or its restore did not stick): give a pinned tab
+                    // its background focus emulation back.
+                    self.set_focus_emulation(&session_id, true).await;
                 }
                 Err(error)
             }
         }
+    }
+
+    /// Flip focus emulation on one tab. Best effort: a tab that is gone
+    /// reports an error the caller already handles.
+    async fn set_focus_emulation(&self, session_id: &str, enabled: bool) {
+        let _ = self
+            .client
+            .send_command(
+                "Emulation.setFocusEmulationEnabled",
+                Some(json!({ "enabled": enabled })),
+                Some(session_id),
+            )
+            .await;
     }
 
     /// Turns the page state behind a mode on or off. `Throttled` has none.
@@ -2520,11 +2555,18 @@ impl BrowserManager {
 
     /// Unfreezes a page and says whether it is no longer frozen. A page whose
     /// target is gone counts. One that does not answer in time does not.
+    /// A thawed tab of a pinned session rejoins the background focus
+    /// emulation `tab keep frozen` dropped so the freeze could stick.
     async fn thaw(&self, session_id: &str) -> bool {
         let request = self.apply_keep(session_id, TabKeep::Frozen, false);
         match tokio::time::timeout(Duration::from_millis(RENDERER_PROBE_TIMEOUT_MS), request).await
         {
-            Ok(Ok(())) => true,
+            Ok(Ok(())) => {
+                if self.pin_tab {
+                    self.set_focus_emulation(session_id, true).await;
+                }
+                true
+            }
             Ok(Err(error)) => is_session_detached_error(&error),
             Err(_) => false,
         }
