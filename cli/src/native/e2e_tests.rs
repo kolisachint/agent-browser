@@ -17101,9 +17101,11 @@ async fn e2e_pin_tab_setting_off_releases_the_manager_pin() {
     let binding_a = load_binding("e2e-release-a", "session A binding should persist");
     let mut state_b = attach_pinned_session(&guard, "e2e-release-b", &ws_url, url_b).await;
 
+    // A pinned session refuses another session's tab, so session A closes its
+    // own tab to reach the gone state below.
     let resp = execute_command(
-        &json!({ "id": "b-close-a", "action": "tab_close", "tabId": binding_a.target_id }),
-        &mut state_b,
+        &json!({ "id": "a-close-own", "action": "tab_close", "tabId": binding_a.target_id }),
+        &mut state_a,
     )
     .await;
     assert_success(&resp);
@@ -17141,11 +17143,12 @@ async fn e2e_pin_tab_gone_error_and_recovery() {
     let binding_a = load_binding("e2e-gone-a", "session A binding should persist");
     let mut state_b = attach_pinned_session(&guard, "e2e-gone-b", &ws_url, url_b).await;
 
-    // Session B closes A's tab by targetId (targetIds are accepted anywhere a
-    // tab ref is accepted and are stable across daemons).
+    // Session A closes its own tab by targetId (targetIds are accepted
+    // anywhere a tab ref is accepted and are stable across daemons). A pinned
+    // session refuses another session's tab, so the owner performs the close.
     let resp = execute_command(
-        &json!({ "id": "b-close-a", "action": "tab_close", "tabId": binding_a.target_id }),
-        &mut state_b,
+        &json!({ "id": "a-close-own", "action": "tab_close", "tabId": binding_a.target_id }),
+        &mut state_a,
     )
     .await;
     assert_success(&resp);

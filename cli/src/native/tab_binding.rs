@@ -20,6 +20,12 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Suffixes temp binding files so concurrent saves in one process never share
+/// a temp path: with a shared name one save's error-path cleanup could remove
+/// another save's in-flight temp, or two writes could interleave into one.
+static SAVE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A persisted session to tab binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,7 +136,11 @@ pub fn save(session: &str, binding: &TabBinding) -> Result<(), String> {
         fs::create_dir_all(dir)
             .map_err(|e| format!("cannot create socket dir {}: {}", dir.display(), e))?;
     }
-    let tmp = path.with_extension(format!("target.tmp.{}", std::process::id()));
+    let tmp = path.with_extension(format!(
+        "target.tmp.{}.{}",
+        std::process::id(),
+        SAVE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     let write_result = (|| -> Result<(), String> {
         let mut options = fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
@@ -380,12 +390,20 @@ mod tests {
             };
             save("tmpcheck", &binding).unwrap();
             let dir = binding_path("tmpcheck").parent().unwrap().to_path_buf();
-            let leftovers: Vec<_> = fs::read_dir(dir)
+            let mut names: Vec<_> = fs::read_dir(&dir)
                 .unwrap()
                 .filter_map(|e| e.ok())
-                .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+                .map(|e| e.file_name())
                 .collect();
-            assert!(leftovers.is_empty(), "temp files left: {:?}", leftovers);
+            names.sort();
+            let leftovers: Vec<_> = names
+                .iter()
+                .filter(|name| name.to_string_lossy().contains(".tmp."))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "temp files left: {leftovers:?} in {names:?}"
+            );
         });
     }
 
