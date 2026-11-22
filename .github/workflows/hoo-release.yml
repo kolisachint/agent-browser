@@ -1,0 +1,260 @@
+# Fork-only release pipeline: plain agent-browser CLI binaries for hoo-browser.
+#
+# Flow: a PR merged with a `cargo:patch` / `cargo:minor` / `cargo:major` label
+# (or a manual `workflow_dispatch`) publishes one GitHub release
+# `v<base>-hoo.<N>` with four plain binaries plus SHA256SUMS:
+#   agent-browser-linux-x86_64, agent-browser-linux-aarch64,
+#   agent-browser-darwin-aarch64, agent-browser-darwin-x86_64
+# The hoo-browser plugin pins these by asset name + sha256 and detects this
+# fork ("scoped" mode) when `agent-browser --version` contains "-hoo.".
+#
+# Version rule: base = `version` in cli/Cargo.toml (e.g. 0.43.0); N = 1 + the
+# max N of existing tags `v<base>-hoo.N` (N restarts at 1 when base changes).
+# The cargo:* label only selects which PRs trigger a release — patch, minor
+# and major all publish the next -hoo.N. Keeping it simple: every release
+# increments N; nothing else reads the label.
+#
+# The `-hoo.N` suffix is stamped at build time by rewriting the package
+# version in cli/Cargo.toml inside the job (never committed), so every
+# `env!("CARGO_PKG_VERSION")` site (cli/src/output.rs print_version and
+# friends) reports it and `--version` prints `agent-browser <base>-hoo.<N>`.
+#
+# This workflow never runs upstream: every job is gated on
+# `github.repository == 'kolisachint/agent-browser'`.
+name: hoo-release
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which cargo label this manual run stands in for (informational only; every run publishes the next -hoo.N).
+        required: false
+        default: patch
+        type: choice
+        options: [patch, minor, major]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hoo-release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Resolve -hoo.N version
+    if: >-
+      github.repository == 'kolisachint/agent-browser' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.pull_request.merged == true &&
+        (contains(github.event.pull_request.labels.*.name, 'cargo:patch') ||
+         contains(github.event.pull_request.labels.*.name, 'cargo:minor') ||
+         contains(github.event.pull_request.labels.*.name, 'cargo:major'))))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      base: ${{ steps.calc.outputs.base }}
+      n: ${{ steps.calc.outputs.n }}
+      full: ${{ steps.calc.outputs.full }}
+      tag: ${{ steps.calc.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Compute next -hoo.N
+        id: calc
+        run: |
+          set -euo pipefail
+          BASE=$(grep '^version = ' cli/Cargo.toml | head -n 1 | sed 's/^version = "\(.*\)"$/\1/')
+          echo "Base version from cli/Cargo.toml: $BASE"
+          BASE_RX=$(printf '%s' "$BASE" | sed 's/\./\\./g')
+          MAX_N=$(git ls-remote --tags origin \
+            | awk -v base="$BASE_RX" '$2 ~ ("^refs/tags/v" base "-hoo\\.[0-9]+$") { n = $2; sub(/.*-hoo\./, "", n); if ((n + 0) > (max + 0)) max = n } END { print max + 0 }')
+          N=$((MAX_N + 1))
+          FULL="$BASE-hoo.$N"
+          TAG="v$FULL"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "Trigger: merged PR #${{ github.event.pull_request.number }}"
+          else
+            echo "Trigger: workflow_dispatch (bump=${{ inputs.bump }})"
+          fi
+          echo "Highest existing N for base $BASE: $MAX_N -> publishing $TAG"
+          {
+            echo "base=$BASE"
+            echo "n=$N"
+            echo "full=$FULL"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.asset }})
+    needs: version
+    if: >-
+      github.repository == 'kolisachint/agent-browser' &&
+      needs.version.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.pull_request.merged == true &&
+        (contains(github.event.pull_request.labels.*.name, 'cargo:patch') ||
+         contains(github.event.pull_request.labels.*.name, 'cargo:minor') ||
+         contains(github.event.pull_request.labels.*.name, 'cargo:major'))))
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: agent-browser-linux-x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - asset: agent-browser-linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - asset: agent-browser-darwin-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - asset: agent-browser-darwin-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+
+      - name: Install npm dependencies
+        run: pnpm install --frozen-lockfile
+
+      # rust-embed bakes packages/dashboard/out into the binary; build it so
+      # the fork binaries match upstream releases (otherwise build.rs embeds
+      # a placeholder page).
+      - name: Build dashboard
+        run: pnpm --filter dashboard build
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: cli
+
+      # Stamp -hoo.N at build time only; the file is never committed, so
+      # cli/Cargo.toml keeps the plain upstream base version. This flows into
+      # every env!("CARGO_PKG_VERSION") site, including --version output.
+      - name: Stamp -hoo.N version (uncommitted)
+        run: |
+          set -euo pipefail
+          FULL="${{ needs.version.outputs.full }}"
+          sed -i.bak "s/^version = \".*\"/version = \"$FULL\"/" cli/Cargo.toml
+          rm cli/Cargo.toml.bak
+          echo "Stamped cli/Cargo.toml:"
+          grep '^version = ' cli/Cargo.toml
+          git diff --stat
+
+      - name: Build release binary
+        run: cargo build --release --manifest-path cli/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Verify -hoo.N version string
+        run: |
+          set -euo pipefail
+          BIN="cli/target/${{ matrix.target }}/release/agent-browser"
+          "$BIN" --version
+          "$BIN" --version | grep -F -- "-hoo."
+
+      - name: Stage asset
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "cli/target/${{ matrix.target }}/release/agent-browser" "dist/${{ matrix.asset }}"
+          chmod +x "dist/${{ matrix.asset }}"
+
+      - name: Upload asset
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          retention-days: 7
+
+  release:
+    name: Tag and publish GitHub release
+    needs: [version, build]
+    if: >-
+      github.repository == 'kolisachint/agent-browser' &&
+      needs.version.result == 'success' &&
+      needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write SHA256SUMS and release notes
+        run: |
+          set -euo pipefail
+          ls -la dist/
+          shopt -s nullglob
+          assets=(dist/agent-browser-*)
+          test "${#assets[@]}" = "4"
+          (cd dist && sha256sum agent-browser-* > SHA256SUMS)
+          cat dist/SHA256SUMS
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            TRIGGER="merged PR #${{ github.event.pull_request.number }} (${{ join(github.event.pull_request.labels.*.name, ', ') }})"
+            SHA="${{ github.event.pull_request.merge_commit_sha }}"
+          else
+            TRIGGER="workflow_dispatch (bump=${{ inputs.bump }})"
+            SHA="${{ github.sha }}"
+          fi
+          echo "$SHA" > dist/.target-sha
+          cat > dist/NOTES.md << EOF
+          Fork CLI release for the hoo-browser plugin.
+
+          - Version: \`${{ needs.version.outputs.full }}\` (upstream base \`${{ needs.version.outputs.base }}\`, fork suffix \`-hoo.${{ needs.version.outputs.n }}\`)
+          - Trigger: $TRIGGER
+          - Source: $SHA
+          - \`agent-browser --version\` prints \`agent-browser ${{ needs.version.outputs.full }}\`; the plugin detects this fork ("scoped" mode) by the \`-hoo.\` marker and downloads the per-platform asset below, verifying the sha256 in \`SHA256SUMS\`.
+
+          Every release (cargo:patch, cargo:minor and cargo:major alike) publishes the next \`-hoo.N\` for the current base; N restarts at 1 when the upstream base version changes.
+          EOF
+          cat dist/NOTES.md
+
+      - name: Create tag and GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.version.outputs.tag }}"
+          SHA=$(cat dist/.target-sha)
+          rm dist/.target-sha
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; refusing to overwrite (re-run bumps N instead)."
+            exit 1
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "$TAG" \
+            --notes-file dist/NOTES.md \
+            --latest=false \
+            dist/agent-browser-linux-x86_64 \
+            dist/agent-browser-linux-aarch64 \
+            dist/agent-browser-darwin-aarch64 \
+            dist/agent-browser-darwin-x86_64 \
+            dist/SHA256SUMS
